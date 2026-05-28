@@ -247,6 +247,7 @@ pub struct SketchBoard {
     style: Style,
     im_context: gtk::IMMulticontext,
     last_saved_filepath: RefCell<Option<String>>,
+    temporary_pointer_noop_drag: bool,
 }
 
 impl SketchBoard {
@@ -747,6 +748,7 @@ impl SketchBoard {
         if self.active_tool.borrow().active() {
             self.active_tool.borrow_mut().handle_undo()
         } else if self.renderer.undo() {
+            self.renderer.set_cursor_from_name(None);
             ToolUpdateResult::Redraw
         } else {
             ToolUpdateResult::Unmodified
@@ -757,6 +759,7 @@ impl SketchBoard {
         if self.active_tool.borrow().active() {
             self.active_tool.borrow_mut().handle_redo()
         } else if self.renderer.redo() {
+            self.renderer.set_cursor_from_name(None);
             ToolUpdateResult::Redraw
         } else {
             ToolUpdateResult::Unmodified
@@ -766,6 +769,7 @@ impl SketchBoard {
     fn handle_reset(&mut self) -> ToolUpdateResult {
         // can't use lazy || here
         if self.deactivate_active_tool() | self.renderer.reset() {
+            self.renderer.set_cursor_from_name(None);
             ToolUpdateResult::Redraw
         } else {
             ToolUpdateResult::Unmodified
@@ -802,6 +806,7 @@ impl SketchBoard {
     ) -> ToolUpdateResult {
         match toolbar_event {
             ToolbarEvent::ToolSelected(tool) => {
+                self.temporary_pointer_noop_drag = false;
                 // deactivate old tool and save drawable, if any
                 let old_tool = self.active_tool.clone();
                 let mut deactivate_result =
@@ -814,6 +819,9 @@ impl SketchBoard {
                 // change active tool
                 self.active_tool = self.tools.get(&tool);
                 self.renderer.set_active_tool(self.active_tool.clone());
+                if tool != Tools::Pointer {
+                    self.renderer.set_cursor_from_name(None);
+                }
                 let widget_ref: gtk::Widget = self.renderer.clone().upcast();
                 self.active_tool
                     .borrow_mut()
@@ -1003,18 +1011,95 @@ impl SketchBoard {
         self.active_tool.borrow().get_tool_type()
     }
 
+    fn active_text_editing(&self) -> bool {
+        self.active_tool_type() == Tools::Text && self.active_tool.borrow().input_enabled()
+    }
+
+    fn temporary_pointer_modifier(event: &MouseEventMsg) -> bool {
+        event.modifier.contains(ModifierType::CONTROL_MASK)
+    }
+
     fn handle_pointer_object_event(
         &mut self,
         event: &InputEvent,
         sender: &ComponentSender<Self>,
     ) -> Option<ToolUpdateResult> {
-        if self.active_tool_type() != Tools::Pointer {
-            return None;
-        }
-
         let InputEvent::Mouse(event) = event else {
             return None;
         };
+
+        let active_tool = self.active_tool_type();
+        let hover_pos = || self.renderer.abs_canvas_to_image_coordinates(event.pos);
+
+        if active_tool != Tools::Pointer {
+            if self.active_text_editing() {
+                if event.type_ == MouseEventType::PointerPos {
+                    self.renderer.set_cursor_from_name(None);
+                }
+                return None;
+            }
+
+            if event.type_ == MouseEventType::PointerPos {
+                let cursor = if Self::temporary_pointer_modifier(event) {
+                    self.renderer.temporary_pointer_hover_cursor(hover_pos())
+                } else {
+                    None
+                };
+                self.renderer
+                    .set_cursor_from_name(cursor.map(|cursor| cursor.name()));
+                return None;
+            }
+
+            if event.button != MouseButton::Primary {
+                return None;
+            }
+
+            if self.temporary_pointer_noop_drag {
+                if event.type_ == MouseEventType::EndDrag {
+                    self.temporary_pointer_noop_drag = false;
+                }
+                return match event.type_ {
+                    MouseEventType::UpdateDrag | MouseEventType::EndDrag => {
+                        Some(ToolUpdateResult::StopPropagation)
+                    }
+                    _ => None,
+                };
+            }
+
+            if self.renderer.pointer_edit_active() {
+                return self.handle_pointer_drag_event(event);
+            }
+
+            if !Self::temporary_pointer_modifier(event) {
+                return None;
+            }
+
+            return match event.type_ {
+                MouseEventType::Click => {
+                    Some(if self.renderer.temporary_pointer_click(event.pos) {
+                        ToolUpdateResult::RedrawAndStopPropagation
+                    } else {
+                        ToolUpdateResult::StopPropagation
+                    })
+                }
+                MouseEventType::BeginDrag => {
+                    if self.renderer.temporary_pointer_begin_drag(event.pos) {
+                        Some(ToolUpdateResult::RedrawAndStopPropagation)
+                    } else {
+                        self.temporary_pointer_noop_drag = true;
+                        Some(ToolUpdateResult::StopPropagation)
+                    }
+                }
+                _ => None,
+            };
+        };
+
+        if event.type_ == MouseEventType::PointerPos {
+            let cursor = self.renderer.pointer_hover_cursor(hover_pos());
+            self.renderer
+                .set_cursor_from_name(cursor.map(|cursor| cursor.name()));
+            return None;
+        }
         if event.button != MouseButton::Primary {
             return None;
         }
@@ -1055,6 +1140,15 @@ impl SketchBoard {
                 .renderer
                 .pointer_begin_drag(event.pos)
                 .then_some(ToolUpdateResult::RedrawAndStopPropagation),
+            MouseEventType::UpdateDrag | MouseEventType::EndDrag => {
+                self.handle_pointer_drag_event(event)
+            }
+            _ => None,
+        }
+    }
+
+    fn handle_pointer_drag_event(&self, event: &MouseEventMsg) -> Option<ToolUpdateResult> {
+        match event.type_ {
             MouseEventType::UpdateDrag => self
                 .renderer
                 .pointer_update_drag(event.pos)
@@ -1066,7 +1160,7 @@ impl SketchBoard {
                     }
                     Some(ToolUpdateResult::RedrawAndStopPropagation)
                 } else {
-                    None
+                    Some(ToolUpdateResult::StopPropagation)
                 }
             }
             _ => None,
@@ -1414,6 +1508,7 @@ impl Component for SketchBoard {
             tools,
             im_context,
             last_saved_filepath: RefCell::new(None),
+            temporary_pointer_noop_drag: false,
         };
 
         let area = &mut model.renderer;
@@ -1520,7 +1615,8 @@ impl KeyEventMsg {
 
 #[cfg(test)]
 mod tests {
-    use super::SketchBoard;
+    use super::{MouseButton, MouseEventMsg, MouseEventType, SketchBoard};
+    use relm4::gtk::gdk::ModifierType;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1549,6 +1645,20 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn temporary_pointer_modifier_uses_contains() {
+        let event = MouseEventMsg {
+            type_: MouseEventType::BeginDrag,
+            button: MouseButton::Primary,
+            modifier: ModifierType::CONTROL_MASK | ModifierType::BUTTON1_MASK,
+            pos: crate::math::Vec2D::zero(),
+            n_pressed: 1,
+            release: false,
+        };
+
+        assert!(SketchBoard::temporary_pointer_modifier(&event));
     }
 
     #[test]

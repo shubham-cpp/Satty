@@ -87,10 +87,43 @@ enum ObjectEditAction {
     Resize(EditHandle),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerCursor {
+    Move,
+    ResizeNwSe,
+    ResizeNeSw,
+    ResizeNs,
+    ResizeEw,
+    ResizeAll,
+}
+
+impl PointerCursor {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Move => "move",
+            Self::ResizeNwSe => "nwse-resize",
+            Self::ResizeNeSw => "nesw-resize",
+            Self::ResizeNs => "ns-resize",
+            Self::ResizeEw => "ew-resize",
+            Self::ResizeAll => "all-resize",
+        }
+    }
+}
+
 struct ObjectEdit {
     index: usize,
     action: ObjectEditAction,
     before: Box<dyn Drawable>,
+}
+
+fn cursor_for_handle(handle: EditHandle) -> PointerCursor {
+    match handle {
+        EditHandle::TopLeft | EditHandle::BottomRight => PointerCursor::ResizeNwSe,
+        EditHandle::TopRight | EditHandle::BottomLeft => PointerCursor::ResizeNeSw,
+        EditHandle::Top | EditHandle::Bottom => PointerCursor::ResizeNs,
+        EditHandle::Right | EditHandle::Left => PointerCursor::ResizeEw,
+        EditHandle::Start | EditHandle::End => PointerCursor::ResizeAll,
+    }
 }
 
 #[glib::object_subclass]
@@ -510,34 +543,77 @@ impl FemtoVgAreaMut {
 
     pub fn pointer_begin_drag(&mut self, pos: Vec2D) -> bool {
         self.active_object_edit = None;
-        let tolerance = self.object_hit_tolerance();
 
-        if let Some(index) = self.selected_drawable
-            && let Some(drawable) = self.drawables.get(index)
-            && let Some(handle) = edit::closest_handle(&drawable.edit_handles(), pos, tolerance)
-        {
-            self.active_object_edit = Some(ObjectEdit {
-                index,
-                action: ObjectEditAction::Resize(handle),
-                before: drawable.edit_snapshot(),
-            });
+        if let Some((index, handle)) = self.find_selected_handle_at(pos) {
+            self.start_object_edit(index, ObjectEditAction::Resize(handle));
             return true;
         }
 
         let old_selection = self.selected_drawable;
         self.selected_drawable = self.find_drawable_at(pos);
         self.style_target_drawable = self.selected_drawable;
-        if let Some(index) = self.selected_drawable
-            && let Some(drawable) = self.drawables.get(index)
-        {
-            self.active_object_edit = Some(ObjectEdit {
-                index,
-                action: ObjectEditAction::Move,
-                before: drawable.edit_snapshot(),
-            });
+        if let Some(index) = self.selected_drawable {
+            self.start_object_edit(index, ObjectEditAction::Move);
         }
 
         old_selection != self.selected_drawable || self.active_object_edit.is_some()
+    }
+
+    pub fn pointer_hover_cursor(&self, pos: Vec2D) -> Option<PointerCursor> {
+        let tolerance = self.object_hit_tolerance();
+
+        if let Some(index) = self.selected_drawable
+            && let Some(drawable) = self.drawables.get(index)
+            && let Some(handle) = edit::closest_handle(&drawable.edit_handles(), pos, tolerance)
+        {
+            return Some(cursor_for_handle(handle));
+        }
+
+        self.find_drawable_at(pos).map(|_| PointerCursor::Move)
+    }
+
+    pub fn temporary_pointer_click(&mut self, pos: Vec2D) -> bool {
+        self.active_object_edit = None;
+
+        if let Some(index) = self.find_drawable_at(pos) {
+            self.selected_drawable = None;
+            self.style_target_drawable = Some(index);
+            return true;
+        }
+
+        false
+    }
+
+    pub fn temporary_pointer_begin_drag(&mut self, pos: Vec2D) -> bool {
+        self.active_object_edit = None;
+
+        if let Some((index, handle)) = self.find_any_handle_at(pos) {
+            self.selected_drawable = None;
+            self.style_target_drawable = Some(index);
+            self.start_object_edit(index, ObjectEditAction::Resize(handle));
+            return true;
+        }
+
+        if let Some(index) = self.find_drawable_at(pos) {
+            self.selected_drawable = None;
+            self.style_target_drawable = Some(index);
+            self.start_object_edit(index, ObjectEditAction::Move);
+            return true;
+        }
+
+        false
+    }
+
+    pub fn temporary_pointer_hover_cursor(&self, pos: Vec2D) -> Option<PointerCursor> {
+        if let Some((_, handle)) = self.find_any_handle_at(pos) {
+            return Some(cursor_for_handle(handle));
+        }
+
+        self.find_drawable_at(pos).map(|_| PointerCursor::Move)
+    }
+
+    pub fn pointer_edit_active(&self) -> bool {
+        self.active_object_edit.is_some()
     }
 
     pub fn pointer_update_drag(&mut self, delta: Vec2D) -> bool {
@@ -614,6 +690,39 @@ impl FemtoVgAreaMut {
             self.drawables[edit.index].invalidate_edit_cache();
         }
         changed
+    }
+
+    fn find_selected_handle_at(&self, pos: Vec2D) -> Option<(usize, EditHandle)> {
+        let tolerance = self.object_hit_tolerance();
+        let index = self.selected_drawable?;
+        let drawable = self.drawables.get(index)?;
+        let handle = edit::closest_handle(&drawable.edit_handles(), pos, tolerance)?;
+        Some((index, handle))
+    }
+
+    fn find_any_handle_at(&self, pos: Vec2D) -> Option<(usize, EditHandle)> {
+        let tolerance = self.object_hit_tolerance();
+        self.drawables
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, drawable)| {
+                edit::closest_handle(&drawable.edit_handles(), pos, tolerance)
+                    .map(|handle| (index, handle))
+            })
+    }
+
+    fn start_object_edit(&mut self, index: usize, action: ObjectEditAction) -> bool {
+        let Some(drawable) = self.drawables.get(index) else {
+            return false;
+        };
+
+        self.active_object_edit = Some(ObjectEdit {
+            index,
+            action,
+            before: drawable.edit_snapshot(),
+        });
+        true
     }
 
     fn find_drawable_at(&self, pos: Vec2D) -> Option<usize> {
@@ -1064,6 +1173,7 @@ mod tests {
         pos: Vec2D,
         size: Vec2D,
         style: Style,
+        handles: Option<Vec<(EditHandle, Vec2D)>>,
     }
 
     impl Drawable for TestDrawable {
@@ -1092,6 +1202,23 @@ mod tests {
             true
         }
 
+        fn resize(&mut self, handle: EditHandle, delta: Vec2D) -> bool {
+            if delta.is_zero() {
+                return false;
+            }
+
+            let bounds = edit::resize_box(self.edit_bounds().unwrap(), handle, delta);
+            self.pos = bounds.top_left;
+            self.size = bounds.size;
+            true
+        }
+
+        fn edit_handles(&self) -> Vec<(EditHandle, Vec2D)> {
+            self.handles
+                .clone()
+                .unwrap_or_else(|| edit::box_handles(self.edit_bounds().unwrap()))
+        }
+
         fn apply_style_change(&mut self, change: StyleChange) -> bool {
             crate::tools::apply_style_change_to_style(&mut self.style, change)
         }
@@ -1107,6 +1234,24 @@ mod tests {
                 fill: false,
                 annotation_size_factor: 1.0,
             },
+            handles: None,
+        })
+    }
+
+    fn test_line_drawable() -> Box<dyn Drawable> {
+        Box::new(TestDrawable {
+            pos: Vec2D::new(0.0, 0.0),
+            size: Vec2D::new(10.0, 0.0),
+            style: Style {
+                color: Color::red(),
+                size: Size::Medium,
+                fill: false,
+                annotation_size_factor: 1.0,
+            },
+            handles: Some(vec![
+                (EditHandle::Start, Vec2D::new(0.0, 0.0)),
+                (EditHandle::End, Vec2D::new(10.0, 0.0)),
+            ]),
         })
     }
 
@@ -1138,6 +1283,10 @@ mod tests {
 
     fn drawable_pos(area: &FemtoVgAreaMut, index: usize) -> Vec2D {
         area.drawables[index].edit_bounds().unwrap().top_left
+    }
+
+    fn drawable_size(area: &FemtoVgAreaMut, index: usize) -> Vec2D {
+        area.drawables[index].edit_bounds().unwrap().size
     }
 
     fn drawable_style(area: &FemtoVgAreaMut, index: usize) -> Style {
@@ -1218,6 +1367,155 @@ mod tests {
         assert_eq!(area.style_target_drawable, None);
         assert!(!area.apply_style_change_to_target(StyleChange::Color(Color::blue())));
         assert_eq!(drawable_style(&area, 0).color, Color::red());
+    }
+
+    #[test]
+    fn pointer_hover_cursor_uses_selected_resize_handles() {
+        let mut area = test_area();
+        area.commit(test_drawable(0.0));
+        assert!(area.pointer_click(Vec2D::new(5.0, 5.0)));
+
+        assert_eq!(
+            area.pointer_hover_cursor(Vec2D::new(0.0, 0.0)),
+            Some(PointerCursor::ResizeNwSe)
+        );
+        assert_eq!(
+            area.pointer_hover_cursor(Vec2D::new(5.0, 0.0)),
+            Some(PointerCursor::ResizeNs)
+        );
+    }
+
+    #[test]
+    fn pointer_hover_cursor_uses_move_for_object_body() {
+        let mut area = test_area();
+        area.commit(test_drawable(0.0));
+
+        assert_eq!(
+            area.pointer_hover_cursor(Vec2D::new(5.0, 5.0)),
+            Some(PointerCursor::Move)
+        );
+    }
+
+    #[test]
+    fn pointer_hover_cursor_clears_on_empty_area() {
+        let mut area = test_area();
+        area.commit(test_drawable(0.0));
+
+        assert_eq!(area.pointer_hover_cursor(Vec2D::new(50.0, 50.0)), None);
+    }
+
+    #[test]
+    fn pointer_hover_cursor_uses_all_resize_for_line_endpoints() {
+        let mut area = test_area();
+        area.commit(test_line_drawable());
+        assert!(area.pointer_click(Vec2D::new(5.0, 0.0)));
+
+        assert_eq!(
+            area.pointer_hover_cursor(Vec2D::new(10.0, 0.0)),
+            Some(PointerCursor::ResizeAll)
+        );
+    }
+
+    #[test]
+    fn temporary_pointer_hover_cursor_uses_virtual_handles_without_selection() {
+        let mut area = test_area();
+        area.commit(test_drawable(0.0));
+
+        assert_eq!(
+            area.temporary_pointer_hover_cursor(Vec2D::new(0.0, 0.0)),
+            Some(PointerCursor::ResizeNwSe)
+        );
+        assert_eq!(area.selected_drawable, None);
+    }
+
+    #[test]
+    fn temporary_pointer_hover_cursor_uses_move_for_body() {
+        let mut area = test_area();
+        area.scale_factor = 4.0;
+        area.commit(test_drawable(0.0));
+
+        assert_eq!(
+            area.temporary_pointer_hover_cursor(Vec2D::new(5.0, 5.0)),
+            Some(PointerCursor::Move)
+        );
+    }
+
+    #[test]
+    fn temporary_pointer_hover_cursor_clears_on_empty_area() {
+        let mut area = test_area();
+        area.commit(test_drawable(0.0));
+
+        assert_eq!(
+            area.temporary_pointer_hover_cursor(Vec2D::new(50.0, 50.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn temporary_pointer_drag_moves_without_visible_selection() {
+        let mut area = test_area();
+        area.scale_factor = 4.0;
+        area.commit(test_drawable(0.0));
+
+        assert!(area.temporary_pointer_begin_drag(Vec2D::new(5.0, 5.0)));
+        assert_eq!(area.selected_drawable, None);
+        assert_eq!(area.style_target_drawable, Some(0));
+        assert!(area.pointer_end_drag(Vec2D::new(12.0, 0.0)));
+
+        assert_eq!(drawable_pos(&area, 0), Vec2D::new(12.0, 0.0));
+        assert_eq!(area.selected_drawable, None);
+    }
+
+    #[test]
+    fn temporary_pointer_drag_resizes_without_visible_selection() {
+        let mut area = test_area();
+        area.commit(test_drawable(0.0));
+
+        assert!(area.temporary_pointer_begin_drag(Vec2D::new(0.0, 0.0)));
+        assert_eq!(area.selected_drawable, None);
+        assert!(area.pointer_end_drag(Vec2D::new(2.0, 3.0)));
+
+        assert_eq!(drawable_pos(&area, 0), Vec2D::new(2.0, 3.0));
+        assert_eq!(drawable_size(&area, 0), Vec2D::new(8.0, 7.0));
+        assert_eq!(area.selected_drawable, None);
+    }
+
+    #[test]
+    fn temporary_pointer_click_targets_style_without_selecting() {
+        let mut area = test_area();
+        area.commit(test_drawable(0.0));
+
+        assert!(area.temporary_pointer_click(Vec2D::new(5.0, 5.0)));
+        assert_eq!(area.selected_drawable, None);
+        assert_eq!(area.style_target_drawable, Some(0));
+        assert!(area.apply_style_change_to_target(StyleChange::Color(Color::blue())));
+
+        assert_eq!(drawable_style(&area, 0).color, Color::blue());
+        assert_eq!(area.selected_drawable, None);
+    }
+
+    #[test]
+    fn temporary_pointer_click_on_empty_area_preserves_target() {
+        let mut area = test_area();
+        area.commit(test_drawable(0.0));
+
+        assert!(!area.temporary_pointer_click(Vec2D::new(50.0, 50.0)));
+
+        assert_eq!(area.selected_drawable, None);
+        assert_eq!(area.style_target_drawable, Some(0));
+    }
+
+    #[test]
+    fn temporary_pointer_hit_testing_prefers_topmost_drawable() {
+        let mut area = test_area();
+        area.commit(test_drawable(0.0));
+        area.commit(test_drawable(0.0));
+
+        assert!(area.temporary_pointer_click(Vec2D::new(5.0, 5.0)));
+        assert!(area.apply_style_change_to_target(StyleChange::Color(Color::blue())));
+
+        assert_eq!(drawable_style(&area, 0).color, Color::red());
+        assert_eq!(drawable_style(&area, 1).color, Color::blue());
     }
 
     #[test]

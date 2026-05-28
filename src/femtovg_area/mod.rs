@@ -17,6 +17,8 @@ use crate::{
     tools::{CropTool, Drawable, StyleChange, Tool},
 };
 
+pub use imp::PointerCursor;
+
 static FONT_STACK: OnceLock<Vec<FontId>> = OnceLock::new();
 
 pub fn set_font_stack(fonts: Vec<FontId>) {
@@ -221,6 +223,46 @@ impl FemtoVGArea {
             .as_mut()
             .expect("Did you call init before using FemtoVgArea?")
             .pointer_begin_drag(pos)
+    }
+
+    pub fn pointer_hover_cursor(&self, pos: Vec2D) -> Option<PointerCursor> {
+        self.imp()
+            .inner()
+            .as_ref()
+            .expect("Did you call init before using FemtoVgArea?")
+            .pointer_hover_cursor(pos)
+    }
+
+    pub fn temporary_pointer_click(&self, pos: Vec2D) -> bool {
+        self.imp()
+            .inner()
+            .as_mut()
+            .expect("Did you call init before using FemtoVgArea?")
+            .temporary_pointer_click(pos)
+    }
+
+    pub fn temporary_pointer_begin_drag(&self, pos: Vec2D) -> bool {
+        self.imp()
+            .inner()
+            .as_mut()
+            .expect("Did you call init before using FemtoVgArea?")
+            .temporary_pointer_begin_drag(pos)
+    }
+
+    pub fn temporary_pointer_hover_cursor(&self, pos: Vec2D) -> Option<PointerCursor> {
+        self.imp()
+            .inner()
+            .as_ref()
+            .expect("Did you call init before using FemtoVgArea?")
+            .temporary_pointer_hover_cursor(pos)
+    }
+
+    pub fn pointer_edit_active(&self) -> bool {
+        self.imp()
+            .inner()
+            .as_ref()
+            .expect("Did you call init before using FemtoVgArea?")
+            .pointer_edit_active()
     }
 
     pub fn pointer_update_drag(&self, delta: Vec2D) -> bool {
