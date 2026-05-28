@@ -117,9 +117,13 @@ pub trait Tool {
         ToolUpdateResult::Unmodified
     }
 
-    fn start_existing_text_edit(&mut self, drawable: Box<dyn Drawable>, index: usize) -> bool {
-        let _ = (drawable, index);
-        false
+    fn start_existing_text_edit(
+        &mut self,
+        drawable: Box<dyn Drawable>,
+        index: usize,
+    ) -> Result<(), Box<dyn Drawable>> {
+        let _ = index;
+        Err(drawable)
     }
 
     fn set_im_context(&mut self, _context: Option<InputContext>) {}
@@ -153,6 +157,7 @@ where
 }
 
 pub trait Drawable: DrawableClone + Debug + Any {
+    fn as_any(&self) -> &dyn Any;
     fn into_any(self: Box<Self>) -> Box<dyn Any>;
     fn draw(&self, canvas: &mut Canvas<OpenGl>, font: FontId, bounds: (Vec2D, Vec2D))
     -> Result<()>;
@@ -178,6 +183,8 @@ pub trait Drawable: DrawableClone + Debug + Any {
         let _ = (handle, delta);
         false
     }
+    fn begin_edit_session(&mut self) {}
+    fn end_edit_session(&mut self) {}
     fn invalidate_edit_cache(&mut self) {}
     fn edit_snapshot(&self) -> Box<dyn Drawable> {
         self.clone_box()

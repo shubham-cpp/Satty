@@ -55,9 +55,8 @@ pub struct FemtoVgAreaMut {
     drawables: Vec<Box<dyn Drawable>>,
     history: Vec<HistoryAction>,
     redo_history: Vec<HistoryAction>,
-    selected_drawable: Option<usize>,
-    style_target_drawable: Option<usize>,
-    active_object_edit: Option<ObjectEdit>,
+    selection_focus: SelectionFocusState,
+    transform_session: Option<TransformSession>,
     zoom_scale: f32,
     last_scale: f32,
     pointer_offset: Vec2D,
@@ -87,6 +86,49 @@ enum ObjectEditAction {
     Resize(EditHandle),
 }
 
+#[derive(Default)]
+struct SelectionFocusState {
+    selected: Option<usize>,
+    focused: Option<usize>,
+}
+
+impl SelectionFocusState {
+    fn clear_selection(&mut self) {
+        self.selected = None;
+    }
+
+    fn clear(&mut self) {
+        self.selected = None;
+        self.focused = None;
+    }
+
+    fn set_selected(&mut self, index: Option<usize>) {
+        self.selected = index;
+        self.focused = index;
+    }
+
+    fn focus_without_selection(&mut self, index: usize) {
+        self.selected = None;
+        self.focused = Some(index);
+    }
+
+    fn target(&self) -> Option<usize> {
+        self.selected.or(self.focused)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HitPart {
+    Body,
+    Handle(EditHandle),
+}
+
+#[derive(Clone, Copy)]
+struct HitResult {
+    index: usize,
+    part: HitPart,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerCursor {
     Move,
@@ -110,7 +152,16 @@ impl PointerCursor {
     }
 }
 
-struct ObjectEdit {
+impl HitResult {
+    fn action(self) -> ObjectEditAction {
+        match self.part {
+            HitPart::Body => ObjectEditAction::Move,
+            HitPart::Handle(handle) => ObjectEditAction::Resize(handle),
+        }
+    }
+}
+
+struct TransformSession {
     index: usize,
     action: ObjectEditAction,
     before: Box<dyn Drawable>,
@@ -240,9 +291,8 @@ impl FemtoVGArea {
             drawables: Vec::new(),
             history: Vec::new(),
             redo_history: Vec::new(),
-            selected_drawable: None,
-            style_target_drawable: None,
-            active_object_edit: None,
+            selection_focus: SelectionFocusState::default(),
+            transform_session: None,
             zoom_scale: initial_scale,
             pointer_offset: Vec2D::zero(),
             last_offset: Vec2D::zero(),
@@ -377,7 +427,7 @@ impl FemtoVgAreaMut {
         self.clear_object_selection();
         let index = self.drawables.len();
         self.drawables.push(drawable);
-        self.style_target_drawable = Some(index);
+        self.selection_focus.focused = Some(index);
         self.history.push(HistoryAction::Add {
             index,
             drawable: None,
@@ -387,7 +437,7 @@ impl FemtoVgAreaMut {
 
     pub fn undo(&mut self) -> bool {
         self.clear_object_selection();
-        self.style_target_drawable = None;
+        self.selection_focus.focused = None;
         let Some(mut action) = self.history.pop() else {
             return false;
         };
@@ -425,7 +475,7 @@ impl FemtoVgAreaMut {
     }
     pub fn redo(&mut self) -> bool {
         self.clear_object_selection();
-        self.style_target_drawable = None;
+        self.selection_focus.focused = None;
         let Some(mut action) = self.redo_history.pop() else {
             return false;
         };
@@ -462,7 +512,7 @@ impl FemtoVgAreaMut {
     }
     pub fn reset(&mut self) -> bool {
         self.clear_object_selection();
-        self.style_target_drawable = None;
+        self.selection_focus.focused = None;
         if self.drawables.is_empty() {
             return false;
         }
@@ -485,28 +535,27 @@ impl FemtoVgAreaMut {
     pub fn set_active_tool(&mut self, active_tool: Rc<RefCell<dyn Tool>>) {
         if active_tool.borrow().get_tool_type() != Tools::Pointer {
             self.clear_object_selection();
-            self.style_target_drawable = None;
+            self.selection_focus.focused = None;
         }
         self.active_tool = active_tool;
     }
 
     pub fn pointer_click(&mut self, pos: Vec2D) -> bool {
-        let old_selection = self.selected_drawable;
-        self.active_object_edit = None;
-        self.selected_drawable = self.find_drawable_at(pos);
-        self.style_target_drawable = self.selected_drawable;
-        old_selection != self.selected_drawable
+        let old_selection = self.selection_focus.selected;
+        self.transform_session = None;
+        let selection = self.find_drawable_at(pos);
+        self.selection_focus.set_selected(selection);
+        old_selection != self.selection_focus.selected
     }
 
     pub fn take_text_edit_at(&mut self, pos: Vec2D) -> Option<(usize, Box<dyn Drawable>)> {
-        self.active_object_edit = None;
+        self.transform_session = None;
         let index = self.find_drawable_at(pos)?;
         if !self.drawables.get(index)?.supports_text_edit() {
             return None;
         }
 
-        self.selected_drawable = None;
-        self.style_target_drawable = None;
+        self.selection_focus.clear();
         Some((index, self.drawables.remove(index)))
     }
 
@@ -517,7 +566,7 @@ impl FemtoVgAreaMut {
         } else {
             self.drawables.insert(index, drawable);
         }
-        self.style_target_drawable = Some(index);
+        self.selection_focus.focused = Some(index);
     }
 
     pub fn modify_drawable(
@@ -532,7 +581,7 @@ impl FemtoVgAreaMut {
         } else {
             self.drawables.insert(index, after.edit_snapshot());
         }
-        self.style_target_drawable = Some(index);
+        self.selection_focus.focused = Some(index);
         self.history.push(HistoryAction::Modify {
             index,
             before,
@@ -542,27 +591,27 @@ impl FemtoVgAreaMut {
     }
 
     pub fn pointer_begin_drag(&mut self, pos: Vec2D) -> bool {
-        self.active_object_edit = None;
+        self.transform_session = None;
 
-        if let Some((index, handle)) = self.find_selected_handle_at(pos) {
-            self.start_object_edit(index, ObjectEditAction::Resize(handle));
+        if let Some(hit) = self.hit_selected_handle(pos) {
+            self.start_transform_session(hit.index, hit.action());
             return true;
         }
 
-        let old_selection = self.selected_drawable;
-        self.selected_drawable = self.find_drawable_at(pos);
-        self.style_target_drawable = self.selected_drawable;
-        if let Some(index) = self.selected_drawable {
-            self.start_object_edit(index, ObjectEditAction::Move);
+        let old_selection = self.selection_focus.selected;
+        let selection = self.hit_body(pos).map(|hit| hit.index);
+        self.selection_focus.set_selected(selection);
+        if let Some(index) = self.selection_focus.selected {
+            self.start_transform_session(index, ObjectEditAction::Move);
         }
 
-        old_selection != self.selected_drawable || self.active_object_edit.is_some()
+        old_selection != self.selection_focus.selected || self.transform_session.is_some()
     }
 
     pub fn pointer_hover_cursor(&self, pos: Vec2D) -> Option<PointerCursor> {
         let tolerance = self.object_hit_tolerance();
 
-        if let Some(index) = self.selected_drawable
+        if let Some(index) = self.selection_focus.selected
             && let Some(drawable) = self.drawables.get(index)
             && let Some(handle) = edit::closest_handle(&drawable.edit_handles(), pos, tolerance)
         {
@@ -573,11 +622,10 @@ impl FemtoVgAreaMut {
     }
 
     pub fn temporary_pointer_click(&mut self, pos: Vec2D) -> bool {
-        self.active_object_edit = None;
+        self.transform_session = None;
 
         if let Some(index) = self.find_drawable_at(pos) {
-            self.selected_drawable = None;
-            self.style_target_drawable = Some(index);
+            self.selection_focus.focus_without_selection(index);
             return true;
         }
 
@@ -585,19 +633,17 @@ impl FemtoVgAreaMut {
     }
 
     pub fn temporary_pointer_begin_drag(&mut self, pos: Vec2D) -> bool {
-        self.active_object_edit = None;
+        self.transform_session = None;
 
-        if let Some((index, handle)) = self.find_any_handle_at(pos) {
-            self.selected_drawable = None;
-            self.style_target_drawable = Some(index);
-            self.start_object_edit(index, ObjectEditAction::Resize(handle));
+        if let Some(hit) = self.hit_any_handle(pos) {
+            self.selection_focus.focus_without_selection(hit.index);
+            self.start_transform_session(hit.index, hit.action());
             return true;
         }
 
-        if let Some(index) = self.find_drawable_at(pos) {
-            self.selected_drawable = None;
-            self.style_target_drawable = Some(index);
-            self.start_object_edit(index, ObjectEditAction::Move);
+        if let Some(hit) = self.hit_body(pos) {
+            self.selection_focus.focus_without_selection(hit.index);
+            self.start_transform_session(hit.index, ObjectEditAction::Move);
             return true;
         }
 
@@ -605,7 +651,9 @@ impl FemtoVgAreaMut {
     }
 
     pub fn temporary_pointer_hover_cursor(&self, pos: Vec2D) -> Option<PointerCursor> {
-        if let Some((_, handle)) = self.find_any_handle_at(pos) {
+        if let Some(hit) = self.hit_any_handle(pos)
+            && let HitPart::Handle(handle) = hit.part
+        {
             return Some(cursor_for_handle(handle));
         }
 
@@ -613,20 +661,20 @@ impl FemtoVgAreaMut {
     }
 
     pub fn pointer_edit_active(&self) -> bool {
-        self.active_object_edit.is_some()
+        self.transform_session.is_some()
     }
 
     pub fn pointer_update_drag(&mut self, delta: Vec2D) -> bool {
-        self.apply_active_object_edit(delta)
+        self.apply_transform_session(delta, true)
     }
 
     pub fn pointer_end_drag(&mut self, delta: Vec2D) -> bool {
-        if !self.apply_active_object_edit(delta) {
-            self.active_object_edit = None;
+        if !self.apply_transform_session(delta, false) {
+            self.transform_session = None;
             return false;
         }
 
-        let Some(edit) = self.active_object_edit.take() else {
+        let Some(edit) = self.transform_session.take() else {
             return false;
         };
         let Some(drawable) = self.drawables.get(edit.index) else {
@@ -634,26 +682,22 @@ impl FemtoVgAreaMut {
         };
 
         let after = drawable.edit_snapshot();
-        if format!("{:?}", edit.before) == format!("{:?}", after) {
-            return false;
-        }
-
         self.history.push(HistoryAction::Modify {
             index: edit.index,
             before: edit.before,
             after,
         });
-        self.style_target_drawable = Some(edit.index);
+        self.selection_focus.focused = Some(edit.index);
         self.redo_history.clear();
         true
     }
 
     pub fn apply_style_change_to_target(&mut self, change: StyleChange) -> bool {
-        let Some(index) = self.selected_drawable.or(self.style_target_drawable) else {
+        let Some(index) = self.selection_focus.target() else {
             return false;
         };
         if index >= self.drawables.len() {
-            self.style_target_drawable = None;
+            self.selection_focus.focused = None;
             return false;
         }
 
@@ -669,12 +713,12 @@ impl FemtoVgAreaMut {
             after,
         });
         self.redo_history.clear();
-        self.style_target_drawable = Some(index);
+        self.selection_focus.focused = Some(index);
         true
     }
 
-    fn apply_active_object_edit(&mut self, delta: Vec2D) -> bool {
-        let Some(edit) = &self.active_object_edit else {
+    fn apply_transform_session(&mut self, delta: Vec2D, preview: bool) -> bool {
+        let Some(edit) = &self.transform_session else {
             return false;
         };
         if edit.index >= self.drawables.len() {
@@ -682,42 +726,55 @@ impl FemtoVgAreaMut {
         }
 
         self.drawables[edit.index] = edit.before.edit_snapshot();
+        if preview {
+            self.drawables[edit.index].begin_edit_session();
+        }
         let changed = match edit.action {
             ObjectEditAction::Move => self.drawables[edit.index].move_by(delta),
             ObjectEditAction::Resize(handle) => self.drawables[edit.index].resize(handle, delta),
         };
-        if changed {
+        if changed && preview {
             self.drawables[edit.index].invalidate_edit_cache();
+        }
+        if changed && !preview {
+            self.drawables[edit.index].end_edit_session();
         }
         changed
     }
 
-    fn find_selected_handle_at(&self, pos: Vec2D) -> Option<(usize, EditHandle)> {
+    fn hit_selected_handle(&self, pos: Vec2D) -> Option<HitResult> {
         let tolerance = self.object_hit_tolerance();
-        let index = self.selected_drawable?;
+        let index = self.selection_focus.selected?;
         let drawable = self.drawables.get(index)?;
         let handle = edit::closest_handle(&drawable.edit_handles(), pos, tolerance)?;
-        Some((index, handle))
+        Some(HitResult {
+            index,
+            part: HitPart::Handle(handle),
+        })
     }
 
-    fn find_any_handle_at(&self, pos: Vec2D) -> Option<(usize, EditHandle)> {
+    fn hit_any_handle(&self, pos: Vec2D) -> Option<HitResult> {
         let tolerance = self.object_hit_tolerance();
         self.drawables
             .iter()
             .enumerate()
             .rev()
             .find_map(|(index, drawable)| {
-                edit::closest_handle(&drawable.edit_handles(), pos, tolerance)
-                    .map(|handle| (index, handle))
+                edit::closest_handle(&drawable.edit_handles(), pos, tolerance).map(|handle| {
+                    HitResult {
+                        index,
+                        part: HitPart::Handle(handle),
+                    }
+                })
             })
     }
 
-    fn start_object_edit(&mut self, index: usize, action: ObjectEditAction) -> bool {
+    fn start_transform_session(&mut self, index: usize, action: ObjectEditAction) -> bool {
         let Some(drawable) = self.drawables.get(index) else {
             return false;
         };
 
-        self.active_object_edit = Some(ObjectEdit {
+        self.transform_session = Some(TransformSession {
             index,
             action,
             before: drawable.edit_snapshot(),
@@ -726,6 +783,10 @@ impl FemtoVgAreaMut {
     }
 
     fn find_drawable_at(&self, pos: Vec2D) -> Option<usize> {
+        self.hit_body(pos).map(|hit| hit.index)
+    }
+
+    fn hit_body(&self, pos: Vec2D) -> Option<HitResult> {
         let tolerance = self.object_hit_tolerance();
         self.drawables
             .iter()
@@ -734,7 +795,10 @@ impl FemtoVgAreaMut {
             .find(|(_, drawable)| {
                 drawable.edit_bounds().is_some() && drawable.hit_test(pos, tolerance)
             })
-            .map(|(index, _)| index)
+            .map(|(index, _)| HitResult {
+                index,
+                part: HitPart::Body,
+            })
     }
 
     fn object_hit_tolerance(&self) -> f32 {
@@ -742,8 +806,8 @@ impl FemtoVgAreaMut {
     }
 
     fn clear_object_selection(&mut self) {
-        self.selected_drawable = None;
-        self.active_object_edit = None;
+        self.selection_focus.clear_selection();
+        self.transform_session = None;
     }
 
     pub fn render_native_resolution(
@@ -869,7 +933,7 @@ impl FemtoVgAreaMut {
     }
 
     fn render_object_selection(&self, canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl>) {
-        let Some(index) = self.selected_drawable else {
+        let Some(index) = self.selection_focus.selected else {
             return;
         };
         let Some(drawable) = self.drawables.get(index) else {
@@ -1177,6 +1241,10 @@ mod tests {
     }
 
     impl Drawable for TestDrawable {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
             self
         }
@@ -1268,9 +1336,8 @@ mod tests {
             drawables: Vec::new(),
             history: Vec::new(),
             redo_history: Vec::new(),
-            selected_drawable: None,
-            style_target_drawable: None,
-            active_object_edit: None,
+            selection_focus: SelectionFocusState::default(),
+            transform_session: None,
             zoom_scale: 0.0,
             last_scale: 0.0,
             pointer_offset: Vec2D::zero(),
@@ -1319,8 +1386,8 @@ mod tests {
 
         area.commit(test_drawable(0.0));
 
-        assert_eq!(area.selected_drawable, None);
-        assert_eq!(area.style_target_drawable, Some(0));
+        assert_eq!(area.selection_focus.selected, None);
+        assert_eq!(area.selection_focus.focused, Some(0));
     }
 
     #[test]
@@ -1364,7 +1431,7 @@ mod tests {
 
         area.set_active_tool(tools.get(&Tools::Text));
 
-        assert_eq!(area.style_target_drawable, None);
+        assert_eq!(area.selection_focus.focused, None);
         assert!(!area.apply_style_change_to_target(StyleChange::Color(Color::blue())));
         assert_eq!(drawable_style(&area, 0).color, Color::red());
     }
@@ -1425,7 +1492,7 @@ mod tests {
             area.temporary_pointer_hover_cursor(Vec2D::new(0.0, 0.0)),
             Some(PointerCursor::ResizeNwSe)
         );
-        assert_eq!(area.selected_drawable, None);
+        assert_eq!(area.selection_focus.selected, None);
     }
 
     #[test]
@@ -1458,12 +1525,12 @@ mod tests {
         area.commit(test_drawable(0.0));
 
         assert!(area.temporary_pointer_begin_drag(Vec2D::new(5.0, 5.0)));
-        assert_eq!(area.selected_drawable, None);
-        assert_eq!(area.style_target_drawable, Some(0));
+        assert_eq!(area.selection_focus.selected, None);
+        assert_eq!(area.selection_focus.focused, Some(0));
         assert!(area.pointer_end_drag(Vec2D::new(12.0, 0.0)));
 
         assert_eq!(drawable_pos(&area, 0), Vec2D::new(12.0, 0.0));
-        assert_eq!(area.selected_drawable, None);
+        assert_eq!(area.selection_focus.selected, None);
     }
 
     #[test]
@@ -1472,12 +1539,12 @@ mod tests {
         area.commit(test_drawable(0.0));
 
         assert!(area.temporary_pointer_begin_drag(Vec2D::new(0.0, 0.0)));
-        assert_eq!(area.selected_drawable, None);
+        assert_eq!(area.selection_focus.selected, None);
         assert!(area.pointer_end_drag(Vec2D::new(2.0, 3.0)));
 
         assert_eq!(drawable_pos(&area, 0), Vec2D::new(2.0, 3.0));
         assert_eq!(drawable_size(&area, 0), Vec2D::new(8.0, 7.0));
-        assert_eq!(area.selected_drawable, None);
+        assert_eq!(area.selection_focus.selected, None);
     }
 
     #[test]
@@ -1486,12 +1553,12 @@ mod tests {
         area.commit(test_drawable(0.0));
 
         assert!(area.temporary_pointer_click(Vec2D::new(5.0, 5.0)));
-        assert_eq!(area.selected_drawable, None);
-        assert_eq!(area.style_target_drawable, Some(0));
+        assert_eq!(area.selection_focus.selected, None);
+        assert_eq!(area.selection_focus.focused, Some(0));
         assert!(area.apply_style_change_to_target(StyleChange::Color(Color::blue())));
 
         assert_eq!(drawable_style(&area, 0).color, Color::blue());
-        assert_eq!(area.selected_drawable, None);
+        assert_eq!(area.selection_focus.selected, None);
     }
 
     #[test]
@@ -1501,8 +1568,8 @@ mod tests {
 
         assert!(!area.temporary_pointer_click(Vec2D::new(50.0, 50.0)));
 
-        assert_eq!(area.selected_drawable, None);
-        assert_eq!(area.style_target_drawable, Some(0));
+        assert_eq!(area.selection_focus.selected, None);
+        assert_eq!(area.selection_focus.focused, Some(0));
     }
 
     #[test]
@@ -1532,6 +1599,19 @@ mod tests {
 
         assert!(area.redo());
         assert_eq!(drawable_pos(&area, 0), Vec2D::new(12.0, 0.0));
+    }
+
+    #[test]
+    fn noop_pointer_drag_does_not_push_history() {
+        let mut area = test_area();
+        area.commit(test_drawable(0.0));
+        let original_history_len = area.history.len();
+
+        assert!(area.pointer_begin_drag(Vec2D::new(5.0, 5.0)));
+        assert!(!area.pointer_end_drag(Vec2D::zero()));
+
+        assert_eq!(area.history.len(), original_history_len);
+        assert_eq!(drawable_pos(&area, 0), Vec2D::new(0.0, 0.0));
     }
 
     #[test]

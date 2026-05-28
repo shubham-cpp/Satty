@@ -851,62 +851,28 @@ impl SketchBoard {
                     _ => activate_result,
                 }
             }
-            ToolbarEvent::ColorSelected(color) => {
-                self.style.color = color;
-                let apply_to_target = !self.active_tool.borrow().get_drawable().is_some();
-                let tool_result = self
-                    .active_tool
-                    .borrow_mut()
-                    .handle_event(ToolEvent::StyleChanged(self.style));
-                self.apply_style_change_to_target(
-                    StyleChange::Color(color),
-                    tool_result,
-                    apply_to_target,
-                )
-            }
-            ToolbarEvent::SizeSelected(size) => {
-                self.style.size = size;
-                let apply_to_target = !self.active_tool.borrow().get_drawable().is_some();
-                let tool_result = self
-                    .active_tool
-                    .borrow_mut()
-                    .handle_event(ToolEvent::StyleChanged(self.style));
-                self.apply_style_change_to_target(
-                    StyleChange::Size(size),
-                    tool_result,
-                    apply_to_target,
-                )
-            }
+            ToolbarEvent::ColorSelected(color) => self.apply_toolbar_style_change(|style| {
+                style.color = color;
+                StyleChange::Color(color)
+            }),
+            ToolbarEvent::SizeSelected(size) => self.apply_toolbar_style_change(|style| {
+                style.size = size;
+                StyleChange::Size(size)
+            }),
             ToolbarEvent::SaveFile => self.handle_action(&[Action::SaveToFile]),
             ToolbarEvent::CopyClipboard => self.handle_action(&[Action::SaveToClipboard]),
             ToolbarEvent::Undo => self.handle_undo(),
             ToolbarEvent::Redo => self.handle_redo(),
             ToolbarEvent::Reset => self.handle_reset(),
-            ToolbarEvent::ToggleFill => {
-                self.style.fill = !self.style.fill;
-                let apply_to_target = !self.active_tool.borrow().get_drawable().is_some();
-                let tool_result = self
-                    .active_tool
-                    .borrow_mut()
-                    .handle_event(ToolEvent::StyleChanged(self.style));
-                self.apply_style_change_to_target(
-                    StyleChange::Fill(self.style.fill),
-                    tool_result,
-                    apply_to_target,
-                )
-            }
+            ToolbarEvent::ToggleFill => self.apply_toolbar_style_change(|style| {
+                style.fill = !style.fill;
+                StyleChange::Fill(style.fill)
+            }),
             ToolbarEvent::AnnotationSizeChanged(value) => {
-                self.style.annotation_size_factor = value;
-                let apply_to_target = !self.active_tool.borrow().get_drawable().is_some();
-                let tool_result = self
-                    .active_tool
-                    .borrow_mut()
-                    .handle_event(ToolEvent::StyleChanged(self.style));
-                self.apply_style_change_to_target(
-                    StyleChange::AnnotationSizeFactor(value),
-                    tool_result,
-                    apply_to_target,
-                )
+                self.apply_toolbar_style_change(|style| {
+                    style.annotation_size_factor = value;
+                    StyleChange::AnnotationSizeFactor(value)
+                })
             }
             ToolbarEvent::SaveFileAs => self.handle_action(&[Action::SaveToFileAs]),
             ToolbarEvent::Resize => self.handle_resize(),
@@ -934,6 +900,19 @@ impl SketchBoard {
         } else {
             tool_result
         }
+    }
+
+    fn apply_toolbar_style_change(
+        &mut self,
+        update_style: impl FnOnce(&mut Style) -> StyleChange,
+    ) -> ToolUpdateResult {
+        let change = update_style(&mut self.style);
+        let apply_to_target = self.active_tool.borrow().get_drawable().is_none();
+        let tool_result = self
+            .active_tool
+            .borrow_mut()
+            .handle_event(ToolEvent::StyleChanged(self.style));
+        self.apply_style_change_to_target(change, tool_result, apply_to_target)
     }
 
     fn handle_text_commit(
@@ -1122,14 +1101,17 @@ impl SketchBoard {
                     .borrow_mut()
                     .set_sender(sender.input_sender().clone());
 
-                if self
+                let start_result = self
                     .active_tool
                     .borrow_mut()
-                    .start_existing_text_edit(drawable, index)
-                {
-                    Some(ToolUpdateResult::RedrawAndStopPropagation)
-                } else {
-                    None
+                    .start_existing_text_edit(drawable, index);
+                match start_result {
+                    Ok(()) => Some(ToolUpdateResult::RedrawAndStopPropagation),
+                    Err(drawable) => {
+                        self.renderer.restore_drawable(index, drawable);
+                        self.return_to_pointer_tool();
+                        Some(ToolUpdateResult::RedrawAndStopPropagation)
+                    }
                 }
             }
             MouseEventType::Click => self

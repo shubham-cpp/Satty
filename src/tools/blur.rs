@@ -73,13 +73,17 @@ impl Blur {
             ImageFilter::GaussianBlur { sigma },
             src_image_id,
         );
-        //canvas.delete_image(src_image_id);
+        canvas.delete_image(src_image_id);
 
         Ok(dst_image_id)
     }
 }
 
 impl Drawable for Blur {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
         self
     }
@@ -186,9 +190,17 @@ impl Drawable for Blur {
         let bounds = edit::resize_box(bounds, handle, delta);
         self.top_left = bounds.top_left;
         self.size = Some(bounds.size);
-        self.editing = false;
         self.invalidate_edit_cache();
         true
+    }
+
+    fn begin_edit_session(&mut self) {
+        self.editing = true;
+    }
+
+    fn end_edit_session(&mut self) {
+        self.editing = false;
+        self.invalidate_edit_cache();
     }
 
     fn invalidate_edit_cache(&mut self) {
@@ -333,5 +345,39 @@ impl Tool for BlurTool {
 
     fn set_sender(&mut self, sender: Sender<SketchBoardInput>) {
         self.sender = Some(sender);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::style::{Color as SattyColor, Size};
+
+    fn test_blur() -> Blur {
+        Blur {
+            top_left: Vec2D::zero(),
+            size: Some(Vec2D::new(10.0, 10.0)),
+            style: Style {
+                color: SattyColor::red(),
+                size: Size::Medium,
+                fill: false,
+                annotation_size_factor: 1.0,
+            },
+            editing: false,
+            cached_image: RefCell::new(None),
+        }
+    }
+
+    #[test]
+    fn blur_uses_edit_preview_during_session() {
+        let mut blur = test_blur();
+
+        blur.begin_edit_session();
+        assert!(blur.editing);
+        assert!(blur.move_by(Vec2D::new(2.0, 3.0)));
+        assert!(blur.editing);
+
+        blur.end_edit_session();
+        assert!(!blur.editing);
     }
 }

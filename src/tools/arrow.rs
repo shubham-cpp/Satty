@@ -137,6 +137,10 @@ impl Tool for ArrowTool {
 }
 
 impl Drawable for Arrow {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
         self
     }

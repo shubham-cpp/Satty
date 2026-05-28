@@ -216,9 +216,23 @@ impl Text {
         };
         pivot + (origin - pivot) * scale
     }
+
+    fn same_persisted_state(&self, other: &Self) -> bool {
+        self.pos == other.pos
+            && self.style.color == other.style.color
+            && self.style.size == other.style.size
+            && self.style.fill == other.style.fill
+            && (self.style.annotation_size_factor - other.style.annotation_size_factor).abs()
+                <= f32::EPSILON
+            && self.get_text() == other.get_text()
+    }
 }
 
 impl Drawable for Text {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
         self
     }
@@ -494,6 +508,10 @@ impl Drawable for Text {
             .style
             .size
             .to_text_size(self.style.annotation_size_factor) as f32;
+        if current_size <= f32::EPSILON {
+            return false;
+        }
+
         let scale = Self::resize_scale_for_handle(bounds, handle, delta);
         if !scale.is_finite() || scale <= 0.0 {
             return false;
@@ -880,9 +898,16 @@ impl Tool for TextTool {
         }
     }
 
-    fn start_existing_text_edit(&mut self, drawable: Box<dyn Drawable>, index: usize) -> bool {
+    fn start_existing_text_edit(
+        &mut self,
+        drawable: Box<dyn Drawable>,
+        index: usize,
+    ) -> Result<(), Box<dyn Drawable>> {
+        if !drawable.as_any().is::<Text>() {
+            return Err(drawable);
+        }
         let Ok(text) = drawable.into_any().downcast::<Text>() else {
-            return false;
+            unreachable!("checked text type before consuming drawable")
         };
 
         let original = *text;
@@ -900,7 +925,7 @@ impl Tool for TextTool {
         self.text = Some(editing);
         self.existing_edit = Some(ExistingTextEdit { index, original });
         self.input_enabled = true;
-        true
+        Ok(())
     }
 
     fn get_drawable(&self) -> Option<&dyn Drawable> {
@@ -1526,7 +1551,7 @@ impl TextTool {
         if let Some(edit) = existing_edit {
             let after = text.clone_box();
             let before = edit.original.clone_box();
-            if format!("{before:?}") == format!("{after:?}") {
+            if edit.original.same_persisted_state(&text) {
                 ToolUpdateResult::Restore {
                     index: edit.index,
                     drawable: before,
@@ -1966,5 +1991,63 @@ mod tests {
 
         assert_eq!(cloned.get_text().as_str(), "before");
         assert_eq!(text.get_text().as_str(), "after");
+
+        let style = Style {
+            annotation_size_factor: 0.0,
+            ..Default::default()
+        };
+        let mut text = Text::new(Vec2D::new(10.0, 20.0), style, None);
+        text.text_buffer.set_text("hello");
+        *text.rect.borrow_mut() = Rectangle::new(10, 20, 100, 50);
+
+        assert!(!text.resize(EditHandle::BottomRight, Vec2D::new(10.0, 10.0)));
+        assert!(text.pos.x.is_finite());
+        assert!(text.pos.y.is_finite());
+        assert_eq!(text.pos, Vec2D::new(10.0, 20.0));
+
+        let original = Text::new(Vec2D::new(10.0, 20.0), Style::default(), None);
+        original.text_buffer.set_text("same");
+        let mut editing = original.clone();
+        editing.editing = false;
+        let mut tool = TextTool {
+            text: Some(editing),
+            existing_edit: Some(ExistingTextEdit { index: 3, original }),
+            ..Default::default()
+        };
+
+        match tool.finish_text_edit() {
+            ToolUpdateResult::Restore { index, .. } => assert_eq!(index, 3),
+            other => panic!("expected restore for unchanged edit, got {other:?}"),
+        }
+
+        let original = Text::new(Vec2D::new(10.0, 20.0), Style::default(), None);
+        original.text_buffer.set_text("before");
+        let editing = original.clone();
+        editing.text_buffer.set_text("after");
+        let mut tool = TextTool {
+            text: Some(editing),
+            existing_edit: Some(ExistingTextEdit { index: 4, original }),
+            ..Default::default()
+        };
+
+        match tool.finish_text_edit() {
+            ToolUpdateResult::Modify { index, .. } => assert_eq!(index, 4),
+            other => panic!("expected modify for changed edit, got {other:?}"),
+        }
+
+        let original = Text::new(Vec2D::new(10.0, 20.0), Style::default(), None);
+        original.text_buffer.set_text("before");
+        let editing = original.clone();
+        editing.text_buffer.set_text("");
+        let mut tool = TextTool {
+            text: Some(editing),
+            existing_edit: Some(ExistingTextEdit { index: 5, original }),
+            ..Default::default()
+        };
+
+        match tool.finish_text_edit() {
+            ToolUpdateResult::Restore { index, .. } => assert_eq!(index, 5),
+            other => panic!("expected restore for empty edit, got {other:?}"),
+        }
     }
 }
