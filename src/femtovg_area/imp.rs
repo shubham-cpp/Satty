@@ -26,7 +26,7 @@ use crate::{
     math::{Vec2D, rect_ensure_in_bounds, rect_round},
     sketch_board::SketchBoardInput,
     tools::{
-        CropTool, Drawable, Tool, Tools,
+        CropTool, Drawable, StyleChange, Tool, Tools,
         edit::{self, EditHandle},
     },
 };
@@ -56,6 +56,7 @@ pub struct FemtoVgAreaMut {
     history: Vec<HistoryAction>,
     redo_history: Vec<HistoryAction>,
     selected_drawable: Option<usize>,
+    style_target_drawable: Option<usize>,
     active_object_edit: Option<ObjectEdit>,
     zoom_scale: f32,
     last_scale: f32,
@@ -207,6 +208,7 @@ impl FemtoVGArea {
             history: Vec::new(),
             redo_history: Vec::new(),
             selected_drawable: None,
+            style_target_drawable: None,
             active_object_edit: None,
             zoom_scale: initial_scale,
             pointer_offset: Vec2D::zero(),
@@ -342,6 +344,7 @@ impl FemtoVgAreaMut {
         self.clear_object_selection();
         let index = self.drawables.len();
         self.drawables.push(drawable);
+        self.style_target_drawable = Some(index);
         self.history.push(HistoryAction::Add {
             index,
             drawable: None,
@@ -351,6 +354,7 @@ impl FemtoVgAreaMut {
 
     pub fn undo(&mut self) -> bool {
         self.clear_object_selection();
+        self.style_target_drawable = None;
         let Some(mut action) = self.history.pop() else {
             return false;
         };
@@ -388,6 +392,7 @@ impl FemtoVgAreaMut {
     }
     pub fn redo(&mut self) -> bool {
         self.clear_object_selection();
+        self.style_target_drawable = None;
         let Some(mut action) = self.redo_history.pop() else {
             return false;
         };
@@ -424,6 +429,7 @@ impl FemtoVgAreaMut {
     }
     pub fn reset(&mut self) -> bool {
         self.clear_object_selection();
+        self.style_target_drawable = None;
         if self.drawables.is_empty() {
             return false;
         }
@@ -446,6 +452,7 @@ impl FemtoVgAreaMut {
     pub fn set_active_tool(&mut self, active_tool: Rc<RefCell<dyn Tool>>) {
         if active_tool.borrow().get_tool_type() != Tools::Pointer {
             self.clear_object_selection();
+            self.style_target_drawable = None;
         }
         self.active_tool = active_tool;
     }
@@ -454,6 +461,7 @@ impl FemtoVgAreaMut {
         let old_selection = self.selected_drawable;
         self.active_object_edit = None;
         self.selected_drawable = self.find_drawable_at(pos);
+        self.style_target_drawable = self.selected_drawable;
         old_selection != self.selected_drawable
     }
 
@@ -465,6 +473,7 @@ impl FemtoVgAreaMut {
         }
 
         self.selected_drawable = None;
+        self.style_target_drawable = None;
         Some((index, self.drawables.remove(index)))
     }
 
@@ -475,6 +484,7 @@ impl FemtoVgAreaMut {
         } else {
             self.drawables.insert(index, drawable);
         }
+        self.style_target_drawable = Some(index);
     }
 
     pub fn modify_drawable(
@@ -489,6 +499,7 @@ impl FemtoVgAreaMut {
         } else {
             self.drawables.insert(index, after.edit_snapshot());
         }
+        self.style_target_drawable = Some(index);
         self.history.push(HistoryAction::Modify {
             index,
             before,
@@ -515,6 +526,7 @@ impl FemtoVgAreaMut {
 
         let old_selection = self.selected_drawable;
         self.selected_drawable = self.find_drawable_at(pos);
+        self.style_target_drawable = self.selected_drawable;
         if let Some(index) = self.selected_drawable
             && let Some(drawable) = self.drawables.get(index)
         {
@@ -555,7 +567,33 @@ impl FemtoVgAreaMut {
             before: edit.before,
             after,
         });
+        self.style_target_drawable = Some(edit.index);
         self.redo_history.clear();
+        true
+    }
+
+    pub fn apply_style_change_to_target(&mut self, change: StyleChange) -> bool {
+        let Some(index) = self.selected_drawable.or(self.style_target_drawable) else {
+            return false;
+        };
+        if index >= self.drawables.len() {
+            self.style_target_drawable = None;
+            return false;
+        }
+
+        let before = self.drawables[index].edit_snapshot();
+        if !self.drawables[index].apply_style_change(change) {
+            return false;
+        }
+        self.drawables[index].invalidate_edit_cache();
+        let after = self.drawables[index].edit_snapshot();
+        self.history.push(HistoryAction::Modify {
+            index,
+            before,
+            after,
+        });
+        self.redo_history.clear();
+        self.style_target_drawable = Some(index);
         true
     }
 
@@ -1015,13 +1053,17 @@ impl FemtoVgAreaMut {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{ToolsManager, edit::ObjectBounds};
+    use crate::{
+        style::{Color, Size, Style},
+        tools::{StyleChange, ToolsManager, edit::ObjectBounds},
+    };
     use relm4::gtk::gdk_pixbuf::Colorspace;
 
     #[derive(Clone, Debug)]
     struct TestDrawable {
         pos: Vec2D,
         size: Vec2D,
+        style: Style,
     }
 
     impl Drawable for TestDrawable {
@@ -1049,12 +1091,22 @@ mod tests {
             self.pos += delta;
             true
         }
+
+        fn apply_style_change(&mut self, change: StyleChange) -> bool {
+            crate::tools::apply_style_change_to_style(&mut self.style, change)
+        }
     }
 
     fn test_drawable(x: f32) -> Box<dyn Drawable> {
         Box::new(TestDrawable {
             pos: Vec2D::new(x, 0.0),
             size: Vec2D::new(10.0, 10.0),
+            style: Style {
+                color: Color::red(),
+                size: Size::Medium,
+                fill: false,
+                annotation_size_factor: 1.0,
+            },
         })
     }
 
@@ -1072,6 +1124,7 @@ mod tests {
             history: Vec::new(),
             redo_history: Vec::new(),
             selected_drawable: None,
+            style_target_drawable: None,
             active_object_edit: None,
             zoom_scale: 0.0,
             last_scale: 0.0,
@@ -1087,6 +1140,15 @@ mod tests {
         area.drawables[index].edit_bounds().unwrap().top_left
     }
 
+    fn drawable_style(area: &FemtoVgAreaMut, index: usize) -> Style {
+        area.drawables[index]
+            .edit_snapshot()
+            .into_any()
+            .downcast::<TestDrawable>()
+            .unwrap()
+            .style
+    }
+
     #[test]
     fn add_history_undo_redo_moves_drawable_between_stacks() {
         let mut area = test_area();
@@ -1100,6 +1162,62 @@ mod tests {
         assert!(area.redo());
         assert_eq!(area.drawables.len(), 1);
         assert_eq!(drawable_pos(&area, 0), Vec2D::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn commit_sets_style_target_without_selecting_object() {
+        let mut area = test_area();
+
+        area.commit(test_drawable(0.0));
+
+        assert_eq!(area.selected_drawable, None);
+        assert_eq!(area.style_target_drawable, Some(0));
+    }
+
+    #[test]
+    fn style_change_updates_target_in_place_and_is_undoable() {
+        let mut area = test_area();
+        area.commit(test_drawable(0.0));
+        let original_history_len = area.history.len();
+
+        assert!(area.apply_style_change_to_target(StyleChange::Color(Color::blue())));
+
+        assert_eq!(area.drawables.len(), 1);
+        assert_eq!(drawable_style(&area, 0).color, Color::blue());
+        assert_eq!(area.history.len(), original_history_len + 1);
+
+        assert!(area.undo());
+        assert_eq!(area.drawables.len(), 1);
+        assert_eq!(drawable_style(&area, 0).color, Color::red());
+
+        assert!(area.redo());
+        assert_eq!(drawable_style(&area, 0).color, Color::blue());
+    }
+
+    #[test]
+    fn pointer_selection_overrides_previous_style_target() {
+        let mut area = test_area();
+        area.commit(test_drawable(0.0));
+        area.commit(test_drawable(30.0));
+
+        assert!(area.pointer_click(Vec2D::new(5.0, 5.0)));
+        assert!(area.apply_style_change_to_target(StyleChange::Size(Size::Large)));
+
+        assert_eq!(drawable_style(&area, 0).size, Size::Large);
+        assert_eq!(drawable_style(&area, 1).size, Size::Medium);
+    }
+
+    #[test]
+    fn switching_to_drawing_tool_clears_style_target() {
+        let mut area = test_area();
+        let tools = ToolsManager::new();
+        area.commit(test_drawable(0.0));
+
+        area.set_active_tool(tools.get(&Tools::Text));
+
+        assert_eq!(area.style_target_drawable, None);
+        assert!(!area.apply_style_change_to_target(StyleChange::Color(Color::blue())));
+        assert_eq!(drawable_style(&area, 0).color, Color::red());
     }
 
     #[test]

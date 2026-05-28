@@ -12,7 +12,8 @@ use crate::{
 };
 
 use super::{
-    Drawable, DrawableClone, Tool, ToolUpdateResult, Tools,
+    Drawable, DrawableClone, StyleChange, Tool, ToolUpdateResult, Tools,
+    apply_style_change_to_style,
     edit::{self, EditHandle, ObjectBounds},
 };
 
@@ -289,5 +290,9 @@ impl Drawable for Arrow {
             _ => return false,
         }
         true
+    }
+
+    fn apply_style_change(&mut self, change: StyleChange) -> bool {
+        apply_style_change_to_style(&mut self.style, change)
     }
 }

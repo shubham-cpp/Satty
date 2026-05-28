@@ -12,7 +12,8 @@ use crate::{
 };
 
 use super::{
-    Drawable, DrawableClone, Tool, ToolUpdateResult, Tools,
+    Drawable, DrawableClone, StyleChange, Tool, ToolUpdateResult, Tools,
+    apply_style_change_to_style,
     edit::{self, EditHandle, ObjectBounds},
 };
 
@@ -103,6 +104,10 @@ impl Drawable for Ellipse {
         self.centered = true;
         self.finishing = true;
         true
+    }
+
+    fn apply_style_change(&mut self, change: StyleChange) -> bool {
+        apply_style_change_to_style(&mut self.style, change)
     }
 }
 

@@ -8,7 +8,10 @@ use crate::sketch_board::{MouseButton, MouseEventType, SketchBoardInput};
 use crate::style::Style;
 use crate::{math::Vec2D, sketch_board::MouseEventMsg};
 
-use super::{Drawable, DrawableClone, Tool, ToolUpdateResult, Tools};
+use super::{
+    Drawable, DrawableClone, StyleChange, Tool, ToolUpdateResult, Tools,
+    apply_style_change_to_style,
+};
 use relm4::Sender;
 
 pub struct MarkerTool {
@@ -107,6 +110,13 @@ impl Drawable for Marker {
 
     fn handle_redo(&mut self) {
         *self.tool_next_number.borrow_mut() = self.number + 1;
+    }
+
+    fn apply_style_change(&mut self, change: StyleChange) -> bool {
+        match change {
+            StyleChange::Fill(_) => false,
+            other => apply_style_change_to_style(&mut self.style, other),
+        }
     }
 }
 

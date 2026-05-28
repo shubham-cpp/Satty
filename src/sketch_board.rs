@@ -24,7 +24,7 @@ use crate::ime::pango_adapter::spans_from_pango_attrs;
 use crate::math::Vec2D;
 use crate::notification::log_result;
 use crate::style::Style;
-use crate::tools::{Tool, ToolEvent, ToolUpdateResult, Tools, ToolsManager};
+use crate::tools::{StyleChange, Tool, ToolEvent, ToolUpdateResult, Tools, ToolsManager};
 use crate::ui::toolbars::ToolbarEvent;
 use xdg::BaseDirectories;
 
@@ -845,15 +845,29 @@ impl SketchBoard {
             }
             ToolbarEvent::ColorSelected(color) => {
                 self.style.color = color;
-                self.active_tool
+                let apply_to_target = !self.active_tool.borrow().get_drawable().is_some();
+                let tool_result = self
+                    .active_tool
                     .borrow_mut()
-                    .handle_event(ToolEvent::StyleChanged(self.style))
+                    .handle_event(ToolEvent::StyleChanged(self.style));
+                self.apply_style_change_to_target(
+                    StyleChange::Color(color),
+                    tool_result,
+                    apply_to_target,
+                )
             }
             ToolbarEvent::SizeSelected(size) => {
                 self.style.size = size;
-                self.active_tool
+                let apply_to_target = !self.active_tool.borrow().get_drawable().is_some();
+                let tool_result = self
+                    .active_tool
                     .borrow_mut()
-                    .handle_event(ToolEvent::StyleChanged(self.style))
+                    .handle_event(ToolEvent::StyleChanged(self.style));
+                self.apply_style_change_to_target(
+                    StyleChange::Size(size),
+                    tool_result,
+                    apply_to_target,
+                )
             }
             ToolbarEvent::SaveFile => self.handle_action(&[Action::SaveToFile]),
             ToolbarEvent::CopyClipboard => self.handle_action(&[Action::SaveToClipboard]),
@@ -862,15 +876,29 @@ impl SketchBoard {
             ToolbarEvent::Reset => self.handle_reset(),
             ToolbarEvent::ToggleFill => {
                 self.style.fill = !self.style.fill;
-                self.active_tool
+                let apply_to_target = !self.active_tool.borrow().get_drawable().is_some();
+                let tool_result = self
+                    .active_tool
                     .borrow_mut()
-                    .handle_event(ToolEvent::StyleChanged(self.style))
+                    .handle_event(ToolEvent::StyleChanged(self.style));
+                self.apply_style_change_to_target(
+                    StyleChange::Fill(self.style.fill),
+                    tool_result,
+                    apply_to_target,
+                )
             }
             ToolbarEvent::AnnotationSizeChanged(value) => {
                 self.style.annotation_size_factor = value;
-                self.active_tool
+                let apply_to_target = !self.active_tool.borrow().get_drawable().is_some();
+                let tool_result = self
+                    .active_tool
                     .borrow_mut()
-                    .handle_event(ToolEvent::StyleChanged(self.style))
+                    .handle_event(ToolEvent::StyleChanged(self.style));
+                self.apply_style_change_to_target(
+                    StyleChange::AnnotationSizeFactor(value),
+                    tool_result,
+                    apply_to_target,
+                )
             }
             ToolbarEvent::SaveFileAs => self.handle_action(&[Action::SaveToFileAs]),
             ToolbarEvent::Resize => self.handle_resize(),
@@ -881,6 +909,22 @@ impl SketchBoard {
                     .emit(SketchBoardOutput::DimensionsUpdate(Some(dimensions)));
                 ToolUpdateResult::Unmodified
             }*/
+        }
+    }
+
+    fn apply_style_change_to_target(
+        &mut self,
+        change: StyleChange,
+        tool_result: ToolUpdateResult,
+        apply_to_target: bool,
+    ) -> ToolUpdateResult {
+        if apply_to_target && self.renderer.apply_style_change_to_target(change) {
+            if APP_CONFIG.read().auto_copy() {
+                self.renderer.request_render(&[Action::SaveToClipboard]);
+            }
+            ToolUpdateResult::Redraw
+        } else {
+            tool_result
         }
     }
 

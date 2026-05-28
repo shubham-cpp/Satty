@@ -20,7 +20,7 @@ use crate::{
 use satty_cli::command_line;
 
 use super::{
-    Drawable, Tool, ToolUpdateResult, Tools,
+    Drawable, StyleChange, Tool, ToolUpdateResult, Tools, apply_style_change_to_style,
     edit::{self, EditHandle, ObjectBounds},
 };
 
@@ -199,6 +199,19 @@ impl Drawable for HighlightKind {
                 true
             }
             HighlightKind::Freehand(_) => false,
+        }
+    }
+
+    fn apply_style_change(&mut self, change: StyleChange) -> bool {
+        match self {
+            HighlightKind::Block(highlighter) => match change {
+                StyleChange::Fill(_) => false,
+                other => apply_style_change_to_style(&mut highlighter.style, other),
+            },
+            HighlightKind::Freehand(highlighter) => match change {
+                StyleChange::Fill(_) => false,
+                other => apply_style_change_to_style(&mut highlighter.style, other),
+            },
         }
     }
 }

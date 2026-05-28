@@ -24,7 +24,7 @@ use serde_derive::Deserialize;
 use crate::{
     math::Vec2D,
     sketch_board::{InputEvent, KeyEventMsg, MouseEventMsg, SketchBoardInput, TextEventMsg},
-    style::Style,
+    style::{Color, Size, Style},
 };
 
 use satty_cli::command_line;
@@ -184,6 +184,55 @@ pub trait Drawable: DrawableClone + Debug + Any {
     }
     fn supports_text_edit(&self) -> bool {
         false
+    }
+    fn apply_style_change(&mut self, change: StyleChange) -> bool {
+        let _ = change;
+        false
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum StyleChange {
+    Color(Color),
+    Size(Size),
+    Fill(bool),
+    AnnotationSizeFactor(f32),
+}
+
+pub fn apply_style_change_to_style(style: &mut Style, change: StyleChange) -> bool {
+    match change {
+        StyleChange::Color(color) => {
+            if style.color == color {
+                false
+            } else {
+                style.color = color;
+                true
+            }
+        }
+        StyleChange::Size(size) => {
+            if style.size == size {
+                false
+            } else {
+                style.size = size;
+                true
+            }
+        }
+        StyleChange::Fill(fill) => {
+            if style.fill == fill {
+                false
+            } else {
+                style.fill = fill;
+                true
+            }
+        }
+        StyleChange::AnnotationSizeFactor(annotation_size_factor) => {
+            if (style.annotation_size_factor - annotation_size_factor).abs() <= f32::EPSILON {
+                false
+            } else {
+                style.annotation_size_factor = annotation_size_factor;
+                true
+            }
+        }
     }
 }
 

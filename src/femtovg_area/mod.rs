@@ -14,7 +14,7 @@ use crate::{
     configuration::Action,
     math::Vec2D,
     sketch_board::SketchBoardInput,
-    tools::{CropTool, Drawable, Tool},
+    tools::{CropTool, Drawable, StyleChange, Tool},
 };
 
 static FONT_STACK: OnceLock<Vec<FontId>> = OnceLock::new();
@@ -205,6 +205,14 @@ impl FemtoVGArea {
             .as_mut()
             .expect("Did you call init before using FemtoVgArea?")
             .modify_drawable(index, before, after);
+    }
+
+    pub fn apply_style_change_to_target(&self, change: StyleChange) -> bool {
+        self.imp()
+            .inner()
+            .as_mut()
+            .expect("Did you call init before using FemtoVgArea?")
+            .apply_style_change_to_target(change)
     }
 
     pub fn pointer_begin_drag(&self, pos: Vec2D) -> bool {

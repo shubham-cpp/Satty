@@ -13,7 +13,7 @@ use crate::{
 };
 
 use super::{
-    Drawable, DrawableClone, Tool, ToolUpdateResult, Tools,
+    Drawable, DrawableClone, StyleChange, Tool, ToolUpdateResult, Tools,
     edit::{self, EditHandle, ObjectBounds},
 };
 
@@ -197,6 +197,34 @@ impl Drawable for Blur {
 
     fn edit_snapshot(&self) -> Box<dyn Drawable> {
         Box::new(self.clone())
+    }
+
+    fn apply_style_change(&mut self, change: StyleChange) -> bool {
+        let changed = match change {
+            StyleChange::Size(size) => {
+                if self.style.size == size {
+                    false
+                } else {
+                    self.style.size = size;
+                    true
+                }
+            }
+            StyleChange::AnnotationSizeFactor(annotation_size_factor) => {
+                if (self.style.annotation_size_factor - annotation_size_factor).abs()
+                    <= f32::EPSILON
+                {
+                    false
+                } else {
+                    self.style.annotation_size_factor = annotation_size_factor;
+                    true
+                }
+            }
+            StyleChange::Color(_) | StyleChange::Fill(_) => false,
+        };
+        if changed {
+            self.invalidate_edit_cache();
+        }
+        changed
     }
 }
 

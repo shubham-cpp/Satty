@@ -20,7 +20,8 @@ use crate::{
 };
 
 use super::{
-    Drawable, DrawableClone, InputContext, Tool, ToolUpdateResult, Tools,
+    Drawable, DrawableClone, InputContext, StyleChange, Tool, ToolUpdateResult, Tools,
+    apply_style_change_to_style,
     edit::{EditHandle, ObjectBounds},
 };
 use crate::sketch_board::SketchBoardInput;
@@ -521,6 +522,13 @@ impl Drawable for Text {
 
     fn supports_text_edit(&self) -> bool {
         true
+    }
+
+    fn apply_style_change(&mut self, change: StyleChange) -> bool {
+        match change {
+            StyleChange::Fill(_) => false,
+            other => apply_style_change_to_style(&mut self.style, other),
+        }
     }
 }
 

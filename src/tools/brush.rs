@@ -9,7 +9,10 @@ use crate::{
     style::Style,
 };
 
-use super::{Drawable, DrawableClone, Tool, ToolUpdateResult, Tools};
+use super::{
+    Drawable, DrawableClone, StyleChange, Tool, ToolUpdateResult, Tools,
+    apply_style_change_to_style,
+};
 use relm4::Sender;
 
 #[derive(Default)]
@@ -66,6 +69,13 @@ impl Drawable for BrushDrawable {
         canvas.stroke_path(&path, &self.style.into());
         canvas.restore();
         Ok(())
+    }
+
+    fn apply_style_change(&mut self, change: StyleChange) -> bool {
+        match change {
+            StyleChange::Fill(_) => false,
+            other => apply_style_change_to_style(&mut self.style, other),
+        }
     }
 }
 

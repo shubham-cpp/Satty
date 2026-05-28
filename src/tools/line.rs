@@ -12,7 +12,8 @@ use crate::{
 };
 
 use super::{
-    Drawable, DrawableClone, Tool, ToolUpdateResult, Tools,
+    Drawable, DrawableClone, StyleChange, Tool, ToolUpdateResult, Tools,
+    apply_style_change_to_style,
     edit::{self, EditHandle, ObjectBounds},
 };
 
@@ -110,6 +111,13 @@ impl Drawable for Line {
             _ => return false,
         }
         true
+    }
+
+    fn apply_style_change(&mut self, change: StyleChange) -> bool {
+        match change {
+            StyleChange::Fill(_) => false,
+            other => apply_style_change_to_style(&mut self.style, other),
+        }
     }
 }
 
