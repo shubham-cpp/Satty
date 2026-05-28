@@ -11,7 +11,10 @@ use crate::{
     style::Style,
 };
 
-use super::{Drawable, DrawableClone, Tool, ToolUpdateResult, Tools};
+use super::{
+    Drawable, DrawableClone, Tool, ToolUpdateResult, Tools,
+    edit::{self, EditHandle, ObjectBounds},
+};
 
 #[derive(Default)]
 pub struct LineTool {
@@ -51,6 +54,58 @@ impl Drawable for Line {
         canvas.restore();
 
         Ok(())
+    }
+
+    fn edit_bounds(&self) -> Option<ObjectBounds> {
+        self.direction
+            .map(|direction| ObjectBounds::from_points(self.start, self.start + direction))
+    }
+
+    fn edit_handles(&self) -> Vec<(EditHandle, Vec2D)> {
+        self.direction
+            .map(|direction| {
+                vec![
+                    (EditHandle::Start, self.start),
+                    (EditHandle::End, self.start + direction),
+                ]
+            })
+            .unwrap_or_default()
+    }
+
+    fn hit_test(&self, pos: Vec2D, tolerance: f32) -> bool {
+        self.direction.is_some_and(|direction| {
+            edit::point_near_segment(pos, self.start, self.start + direction, tolerance)
+        })
+    }
+
+    fn move_by(&mut self, delta: Vec2D) -> bool {
+        if self.direction.is_none() || delta.is_zero() {
+            return false;
+        }
+        self.start += delta;
+        true
+    }
+
+    fn resize(&mut self, handle: EditHandle, delta: Vec2D) -> bool {
+        let Some(direction) = self.direction else {
+            return false;
+        };
+        if delta.is_zero() {
+            return false;
+        }
+
+        match handle {
+            EditHandle::Start => {
+                let end = self.start + direction;
+                self.start += delta;
+                self.direction = Some(end - self.start);
+            }
+            EditHandle::End => {
+                self.direction = Some(direction + delta);
+            }
+            _ => return false,
+        }
+        true
     }
 }
 

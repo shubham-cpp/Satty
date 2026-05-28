@@ -12,15 +12,30 @@ use crate::{
     style::Style,
 };
 
-use super::{Drawable, DrawableClone, Tool, ToolUpdateResult, Tools};
+use super::{
+    Drawable, DrawableClone, Tool, ToolUpdateResult, Tools,
+    edit::{self, EditHandle, ObjectBounds},
+};
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Blur {
     top_left: Vec2D,
     size: Option<Vec2D>,
     style: Style,
     editing: bool,
     cached_image: RefCell<Option<ImageId>>,
+}
+
+impl Clone for Blur {
+    fn clone(&self) -> Self {
+        Self {
+            top_left: self.top_left,
+            size: self.size,
+            style: self.style,
+            editing: self.editing,
+            cached_image: RefCell::new(None),
+        }
+    }
 }
 
 impl Blur {
@@ -141,6 +156,43 @@ impl Drawable for Blur {
             canvas.restore();
         }
         Ok(())
+    }
+
+    fn edit_bounds(&self) -> Option<ObjectBounds> {
+        self.size.map(|size| ObjectBounds::new(self.top_left, size))
+    }
+
+    fn move_by(&mut self, delta: Vec2D) -> bool {
+        if self.size.is_none() || delta.is_zero() {
+            return false;
+        }
+        self.top_left += delta;
+        self.invalidate_edit_cache();
+        true
+    }
+
+    fn resize(&mut self, handle: EditHandle, delta: Vec2D) -> bool {
+        let Some(bounds) = self.edit_bounds() else {
+            return false;
+        };
+        if delta.is_zero() {
+            return false;
+        }
+
+        let bounds = edit::resize_box(bounds, handle, delta);
+        self.top_left = bounds.top_left;
+        self.size = Some(bounds.size);
+        self.editing = false;
+        self.invalidate_edit_cache();
+        true
+    }
+
+    fn invalidate_edit_cache(&mut self) {
+        self.cached_image.borrow_mut().take();
+    }
+
+    fn edit_snapshot(&self) -> Box<dyn Drawable> {
+        Box::new(self.clone())
     }
 }
 

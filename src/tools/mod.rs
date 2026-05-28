@@ -32,6 +32,7 @@ mod arrow;
 mod blur;
 mod brush;
 mod crop;
+pub mod edit;
 mod ellipse;
 mod highlight;
 mod line;
@@ -150,6 +151,30 @@ pub trait Drawable: DrawableClone + Debug {
     -> Result<()>;
     fn handle_undo(&mut self) {}
     fn handle_redo(&mut self) {}
+    fn edit_bounds(&self) -> Option<edit::ObjectBounds> {
+        None
+    }
+    fn edit_handles(&self) -> Vec<(edit::EditHandle, Vec2D)> {
+        self.edit_bounds()
+            .map(edit::box_handles)
+            .unwrap_or_default()
+    }
+    fn hit_test(&self, pos: Vec2D, tolerance: f32) -> bool {
+        self.edit_bounds()
+            .is_some_and(|bounds| bounds.contains(pos, tolerance))
+    }
+    fn move_by(&mut self, delta: Vec2D) -> bool {
+        let _ = delta;
+        false
+    }
+    fn resize(&mut self, handle: edit::EditHandle, delta: Vec2D) -> bool {
+        let _ = (handle, delta);
+        false
+    }
+    fn invalidate_edit_cache(&mut self) {}
+    fn edit_snapshot(&self) -> Box<dyn Drawable> {
+        self.clone_box()
+    }
 }
 
 #[derive(Debug)]

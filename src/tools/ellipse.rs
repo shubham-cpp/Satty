@@ -11,7 +11,10 @@ use crate::{
     style::Style,
 };
 
-use super::{Drawable, DrawableClone, Tool, ToolUpdateResult, Tools};
+use super::{
+    Drawable, DrawableClone, Tool, ToolUpdateResult, Tools,
+    edit::{self, EditHandle, ObjectBounds},
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Ellipse {
@@ -61,6 +64,41 @@ impl Drawable for Ellipse {
         canvas.restore();
 
         Ok(())
+    }
+
+    fn edit_bounds(&self) -> Option<ObjectBounds> {
+        self.radii.map(|radii| {
+            ObjectBounds::new(
+                self.middle - Vec2D::new(radii.x.abs(), radii.y.abs()),
+                Vec2D::new(radii.x.abs() * 2.0, radii.y.abs() * 2.0),
+            )
+        })
+    }
+
+    fn move_by(&mut self, delta: Vec2D) -> bool {
+        if self.radii.is_none() || delta.is_zero() {
+            return false;
+        }
+        self.origin += delta;
+        self.middle += delta;
+        true
+    }
+
+    fn resize(&mut self, handle: EditHandle, delta: Vec2D) -> bool {
+        let Some(bounds) = self.edit_bounds() else {
+            return false;
+        };
+        if delta.is_zero() {
+            return false;
+        }
+
+        let bounds = edit::resize_box(bounds, handle, delta);
+        self.origin = bounds.top_left;
+        self.middle = bounds.center();
+        self.radii = Some(bounds.size * 0.5);
+        self.centered = true;
+        self.finishing = true;
+        true
     }
 }
 

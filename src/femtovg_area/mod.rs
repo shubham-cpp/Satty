@@ -169,4 +169,36 @@ impl FemtoVGArea {
     pub fn resize(&self, width: i32, height: i32) {
         self.imp().resize(width, height);
     }
+
+    pub fn pointer_click(&self, pos: Vec2D) -> bool {
+        self.imp()
+            .inner()
+            .as_mut()
+            .expect("Did you call init before using FemtoVgArea?")
+            .pointer_click(pos)
+    }
+
+    pub fn pointer_begin_drag(&self, pos: Vec2D) -> bool {
+        self.imp()
+            .inner()
+            .as_mut()
+            .expect("Did you call init before using FemtoVgArea?")
+            .pointer_begin_drag(pos)
+    }
+
+    pub fn pointer_update_drag(&self, delta: Vec2D) -> bool {
+        self.imp()
+            .inner()
+            .as_mut()
+            .expect("Did you call init before using FemtoVgArea?")
+            .pointer_update_drag(delta)
+    }
+
+    pub fn pointer_end_drag(&self, delta: Vec2D) -> bool {
+        self.imp()
+            .inner()
+            .as_mut()
+            .expect("Did you call init before using FemtoVgArea?")
+            .pointer_end_drag(delta)
+    }
 }

@@ -11,7 +11,10 @@ use crate::{
     style::Style,
 };
 
-use super::{Drawable, DrawableClone, Tool, ToolUpdateResult, Tools};
+use super::{
+    Drawable, DrawableClone, Tool, ToolUpdateResult, Tools,
+    edit::{self, EditHandle, ObjectBounds},
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Arrow {
@@ -241,5 +244,46 @@ impl Drawable for Arrow {
 
         canvas.restore();
         Ok(())
+    }
+
+    fn edit_bounds(&self) -> Option<ObjectBounds> {
+        self.end
+            .map(|end| ObjectBounds::from_points(self.start, end))
+    }
+
+    fn edit_handles(&self) -> Vec<(EditHandle, Vec2D)> {
+        self.end
+            .map(|end| vec![(EditHandle::Start, self.start), (EditHandle::End, end)])
+            .unwrap_or_default()
+    }
+
+    fn hit_test(&self, pos: Vec2D, tolerance: f32) -> bool {
+        self.end
+            .is_some_and(|end| edit::point_near_segment(pos, self.start, end, tolerance))
+    }
+
+    fn move_by(&mut self, delta: Vec2D) -> bool {
+        if self.end.is_none() || delta.is_zero() {
+            return false;
+        }
+        self.start += delta;
+        self.end = self.end.map(|end| end + delta);
+        true
+    }
+
+    fn resize(&mut self, handle: EditHandle, delta: Vec2D) -> bool {
+        let Some(end) = self.end else {
+            return false;
+        };
+        if delta.is_zero() {
+            return false;
+        }
+
+        match handle {
+            EditHandle::Start => self.start += delta,
+            EditHandle::End => self.end = Some(end + delta),
+            _ => return false,
+        }
+        true
     }
 }

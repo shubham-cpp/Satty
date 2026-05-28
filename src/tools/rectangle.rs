@@ -12,7 +12,10 @@ use crate::{
     style::Style,
 };
 
-use super::{Drawable, DrawableClone, Tool, ToolUpdateResult, Tools};
+use super::{
+    Drawable, DrawableClone, Tool, ToolUpdateResult, Tools,
+    edit::{self, EditHandle, ObjectBounds},
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Rectangle {
@@ -63,6 +66,35 @@ impl Drawable for Rectangle {
         canvas.restore();
 
         Ok(())
+    }
+
+    fn edit_bounds(&self) -> Option<ObjectBounds> {
+        self.size.map(|size| ObjectBounds::new(self.top_left, size))
+    }
+
+    fn move_by(&mut self, delta: Vec2D) -> bool {
+        if self.size.is_none() || delta.is_zero() {
+            return false;
+        }
+        self.origin += delta;
+        self.top_left += delta;
+        true
+    }
+
+    fn resize(&mut self, handle: EditHandle, delta: Vec2D) -> bool {
+        let Some(bounds) = self.edit_bounds() else {
+            return false;
+        };
+        if delta.is_zero() {
+            return false;
+        }
+
+        let bounds = edit::resize_box(bounds, handle, delta);
+        self.origin = bounds.top_left;
+        self.top_left = bounds.top_left;
+        self.size = Some(bounds.size);
+        self.finishing = true;
+        true
     }
 }
 

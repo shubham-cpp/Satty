@@ -929,6 +929,45 @@ impl SketchBoard {
     pub fn active_tool_type(&self) -> Tools {
         self.active_tool.borrow().get_tool_type()
     }
+
+    fn handle_pointer_object_event(&self, event: &InputEvent) -> Option<ToolUpdateResult> {
+        if self.active_tool_type() != Tools::Pointer {
+            return None;
+        }
+
+        let InputEvent::Mouse(event) = event else {
+            return None;
+        };
+        if event.button != MouseButton::Primary {
+            return None;
+        }
+
+        match event.type_ {
+            MouseEventType::Click => self
+                .renderer
+                .pointer_click(event.pos)
+                .then_some(ToolUpdateResult::RedrawAndStopPropagation),
+            MouseEventType::BeginDrag => self
+                .renderer
+                .pointer_begin_drag(event.pos)
+                .then_some(ToolUpdateResult::RedrawAndStopPropagation),
+            MouseEventType::UpdateDrag => self
+                .renderer
+                .pointer_update_drag(event.pos)
+                .then_some(ToolUpdateResult::RedrawAndStopPropagation),
+            MouseEventType::EndDrag => {
+                if self.renderer.pointer_end_drag(event.pos) {
+                    if APP_CONFIG.read().auto_copy() {
+                        self.renderer.request_render(&[Action::SaveToClipboard]);
+                    }
+                    Some(ToolUpdateResult::RedrawAndStopPropagation)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 #[relm4::component(pub)]
@@ -1176,6 +1215,20 @@ impl Component for SketchBoard {
                     }
                 } else {
                     ie.handle_event_mouse_input(&self.renderer);
+                    if let Some(result) = self.handle_pointer_object_event(&ie) {
+                        return match result {
+                            ToolUpdateResult::Commit(drawable) => {
+                                self.renderer.commit(drawable);
+                                if APP_CONFIG.read().auto_copy() {
+                                    self.renderer.request_render(&[Action::SaveToClipboard]);
+                                }
+                                self.refresh_screen();
+                            }
+                            ToolUpdateResult::Unmodified | ToolUpdateResult::StopPropagation => (),
+                            ToolUpdateResult::Redraw
+                            | ToolUpdateResult::RedrawAndStopPropagation => self.refresh_screen(),
+                        };
+                    }
                     let active_tool_result = self
                         .active_tool
                         .borrow_mut()

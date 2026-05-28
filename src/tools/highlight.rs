@@ -19,7 +19,10 @@ use crate::{
 
 use satty_cli::command_line;
 
-use super::{Drawable, Tool, ToolUpdateResult, Tools};
+use super::{
+    Drawable, Tool, ToolUpdateResult, Tools,
+    edit::{self, EditHandle, ObjectBounds},
+};
 
 const HIGHLIGHT_OPACITY: f64 = 0.4;
 
@@ -151,6 +154,47 @@ impl Drawable for HighlightKind {
         match self {
             HighlightKind::Block(highlighter) => highlighter.highlight(canvas),
             HighlightKind::Freehand(highlighter) => highlighter.highlight(canvas),
+        }
+    }
+
+    fn edit_bounds(&self) -> Option<ObjectBounds> {
+        match self {
+            HighlightKind::Block(highlighter) => highlighter
+                .data
+                .size
+                .map(|size| ObjectBounds::new(highlighter.data.top_left, size)),
+            HighlightKind::Freehand(_) => None,
+        }
+    }
+
+    fn move_by(&mut self, delta: Vec2D) -> bool {
+        if delta.is_zero() {
+            return false;
+        }
+        match self {
+            HighlightKind::Block(highlighter) if highlighter.data.size.is_some() => {
+                highlighter.data.top_left += delta;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn resize(&mut self, handle: EditHandle, delta: Vec2D) -> bool {
+        let Some(bounds) = self.edit_bounds() else {
+            return false;
+        };
+        if delta.is_zero() {
+            return false;
+        }
+        match self {
+            HighlightKind::Block(highlighter) => {
+                let bounds = edit::resize_box(bounds, handle, delta);
+                highlighter.data.top_left = bounds.top_left;
+                highlighter.data.size = Some(bounds.size);
+                true
+            }
+            HighlightKind::Freehand(_) => false,
         }
     }
 }
@@ -343,5 +387,41 @@ impl Tool for HighlightTool {
 
     fn set_sender(&mut self, sender: Sender<SketchBoardInput>) {
         self.sender = Some(sender);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::style::{Color, Size};
+
+    fn test_style() -> Style {
+        Style {
+            color: Color::red(),
+            size: Size::Medium,
+            fill: false,
+            annotation_size_factor: 1.0,
+        }
+    }
+
+    #[test]
+    fn block_highlight_is_editable_but_freehand_is_not() {
+        let block = HighlightKind::Block(Highlighter {
+            data: BlockHighlight {
+                top_left: Vec2D::new(1.0, 2.0),
+                size: Some(Vec2D::new(3.0, 4.0)),
+            },
+            style: test_style(),
+        });
+        let freehand = HighlightKind::Freehand(Highlighter {
+            data: FreehandHighlight {
+                points: vec![Vec2D::new(1.0, 2.0), Vec2D::new(3.0, 4.0)],
+                shift_pressed: false,
+            },
+            style: test_style(),
+        });
+
+        assert!(block.edit_bounds().is_some());
+        assert!(freehand.edit_bounds().is_none());
     }
 }

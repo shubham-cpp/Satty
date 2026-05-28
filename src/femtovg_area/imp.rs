@@ -25,7 +25,10 @@ use crate::{
     configuration::Action,
     math::{Vec2D, rect_ensure_in_bounds, rect_round},
     sketch_board::SketchBoardInput,
-    tools::{CropTool, Drawable, Tool},
+    tools::{
+        CropTool, Drawable, Tool, Tools,
+        edit::{self, EditHandle},
+    },
 };
 
 use super::{font_stack, set_font_stack};
@@ -50,7 +53,10 @@ pub struct FemtoVgAreaMut {
     scale_factor: f32,
     offset: Vec2D,
     drawables: Vec<Box<dyn Drawable>>,
-    redo_stack: Vec<Box<dyn Drawable>>,
+    history: Vec<HistoryAction>,
+    redo_history: Vec<HistoryAction>,
+    selected_drawable: Option<usize>,
+    active_object_edit: Option<ObjectEdit>,
     zoom_scale: f32,
     last_scale: f32,
     pointer_offset: Vec2D,
@@ -58,6 +64,32 @@ pub struct FemtoVgAreaMut {
     drag_offset: Vec2D,
     is_drag: bool,
     is_reset: bool,
+}
+
+enum HistoryAction {
+    Add {
+        index: usize,
+        drawable: Option<Box<dyn Drawable>>,
+    },
+    Modify {
+        index: usize,
+        before: Box<dyn Drawable>,
+        after: Box<dyn Drawable>,
+    },
+    Reset {
+        drawables: Vec<Box<dyn Drawable>>,
+    },
+}
+
+enum ObjectEditAction {
+    Move,
+    Resize(EditHandle),
+}
+
+struct ObjectEdit {
+    index: usize,
+    action: ObjectEditAction,
+    before: Box<dyn Drawable>,
 }
 
 #[glib::object_subclass]
@@ -172,7 +204,10 @@ impl FemtoVGArea {
             scale_factor: 1.0,
             offset: Vec2D::zero(),
             drawables: Vec::new(),
-            redo_stack: Vec::new(),
+            history: Vec::new(),
+            redo_history: Vec::new(),
+            selected_drawable: None,
+            active_object_edit: None,
             zoom_scale: initial_scale,
             pointer_offset: Vec2D::zero(),
             last_offset: Vec2D::zero(),
@@ -304,53 +339,224 @@ impl FemtoVGArea {
 
 impl FemtoVgAreaMut {
     pub fn commit(&mut self, drawable: Box<dyn Drawable>) {
+        self.clear_object_selection();
+        let index = self.drawables.len();
         self.drawables.push(drawable);
-        self.redo_stack.clear();
+        self.history.push(HistoryAction::Add {
+            index,
+            drawable: None,
+        });
+        self.redo_history.clear();
     }
 
     pub fn undo(&mut self) -> bool {
-        match self.drawables.pop() {
-            Some(mut d) => {
-                // notify of the undo action
-                d.handle_undo();
+        self.clear_object_selection();
+        let Some(mut action) = self.history.pop() else {
+            return false;
+        };
 
-                // push to redo stack
-                self.redo_stack.push(d);
-                true
+        match &mut action {
+            HistoryAction::Add { index, drawable } => {
+                if *index >= self.drawables.len() {
+                    return false;
+                }
+                let mut removed = self.drawables.remove(*index);
+                removed.handle_undo();
+                *drawable = Some(removed);
             }
-            None => false,
+            HistoryAction::Modify { index, before, .. } => {
+                if *index >= self.drawables.len() {
+                    return false;
+                }
+                self.drawables[*index] = before.edit_snapshot();
+                self.drawables[*index].invalidate_edit_cache();
+            }
+            HistoryAction::Reset { drawables } => {
+                self.drawables = drawables
+                    .iter()
+                    .map(|drawable| {
+                        let mut drawable = drawable.edit_snapshot();
+                        drawable.handle_redo();
+                        drawable
+                    })
+                    .collect();
+            }
         }
+
+        self.redo_history.push(action);
+        true
     }
     pub fn redo(&mut self) -> bool {
-        match self.redo_stack.pop() {
-            Some(mut d) => {
-                // notify of the redo action
-                d.handle_redo();
+        self.clear_object_selection();
+        let Some(mut action) = self.redo_history.pop() else {
+            return false;
+        };
 
-                // push to drawable stack
-                self.drawables.push(d);
-
-                true
+        match &mut action {
+            HistoryAction::Add { index, drawable } => {
+                let Some(mut drawable) = drawable.take() else {
+                    return false;
+                };
+                drawable.handle_redo();
+                if *index >= self.drawables.len() {
+                    self.drawables.push(drawable);
+                } else {
+                    self.drawables.insert(*index, drawable);
+                }
             }
-            None => false,
+            HistoryAction::Modify { index, after, .. } => {
+                if *index >= self.drawables.len() {
+                    return false;
+                }
+                self.drawables[*index] = after.edit_snapshot();
+                self.drawables[*index].invalidate_edit_cache();
+            }
+            HistoryAction::Reset { .. } => {
+                for drawable in &mut self.drawables {
+                    drawable.handle_undo();
+                }
+                self.drawables.clear();
+            }
         }
+
+        self.history.push(action);
+        true
     }
     pub fn reset(&mut self) -> bool {
-        let mut any_undone = false;
-        while let Some(mut d) = self.drawables.pop() {
-            // notify of the undo action
-            d.handle_undo();
-
-            // push to redo stack
-            self.redo_stack.push(d);
-
-            any_undone = true;
+        self.clear_object_selection();
+        if self.drawables.is_empty() {
+            return false;
         }
-        any_undone
+
+        for drawable in &mut self.drawables {
+            drawable.handle_undo();
+        }
+        let removed = std::mem::take(&mut self.drawables);
+        let snapshots = removed
+            .iter()
+            .map(|drawable| drawable.edit_snapshot())
+            .collect();
+        self.history.push(HistoryAction::Reset {
+            drawables: snapshots,
+        });
+        self.redo_history.clear();
+        true
     }
 
     pub fn set_active_tool(&mut self, active_tool: Rc<RefCell<dyn Tool>>) {
+        if active_tool.borrow().get_tool_type() != Tools::Pointer {
+            self.clear_object_selection();
+        }
         self.active_tool = active_tool;
+    }
+
+    pub fn pointer_click(&mut self, pos: Vec2D) -> bool {
+        let old_selection = self.selected_drawable;
+        self.active_object_edit = None;
+        self.selected_drawable = self.find_drawable_at(pos);
+        old_selection != self.selected_drawable
+    }
+
+    pub fn pointer_begin_drag(&mut self, pos: Vec2D) -> bool {
+        self.active_object_edit = None;
+        let tolerance = self.object_hit_tolerance();
+
+        if let Some(index) = self.selected_drawable
+            && let Some(drawable) = self.drawables.get(index)
+            && let Some(handle) = edit::closest_handle(&drawable.edit_handles(), pos, tolerance)
+        {
+            self.active_object_edit = Some(ObjectEdit {
+                index,
+                action: ObjectEditAction::Resize(handle),
+                before: drawable.edit_snapshot(),
+            });
+            return true;
+        }
+
+        let old_selection = self.selected_drawable;
+        self.selected_drawable = self.find_drawable_at(pos);
+        if let Some(index) = self.selected_drawable
+            && let Some(drawable) = self.drawables.get(index)
+        {
+            self.active_object_edit = Some(ObjectEdit {
+                index,
+                action: ObjectEditAction::Move,
+                before: drawable.edit_snapshot(),
+            });
+        }
+
+        old_selection != self.selected_drawable || self.active_object_edit.is_some()
+    }
+
+    pub fn pointer_update_drag(&mut self, delta: Vec2D) -> bool {
+        self.apply_active_object_edit(delta)
+    }
+
+    pub fn pointer_end_drag(&mut self, delta: Vec2D) -> bool {
+        if !self.apply_active_object_edit(delta) {
+            self.active_object_edit = None;
+            return false;
+        }
+
+        let Some(edit) = self.active_object_edit.take() else {
+            return false;
+        };
+        let Some(drawable) = self.drawables.get(edit.index) else {
+            return false;
+        };
+
+        let after = drawable.edit_snapshot();
+        if format!("{:?}", edit.before) == format!("{:?}", after) {
+            return false;
+        }
+
+        self.history.push(HistoryAction::Modify {
+            index: edit.index,
+            before: edit.before,
+            after,
+        });
+        self.redo_history.clear();
+        true
+    }
+
+    fn apply_active_object_edit(&mut self, delta: Vec2D) -> bool {
+        let Some(edit) = &self.active_object_edit else {
+            return false;
+        };
+        if edit.index >= self.drawables.len() {
+            return false;
+        }
+
+        self.drawables[edit.index] = edit.before.edit_snapshot();
+        let changed = match edit.action {
+            ObjectEditAction::Move => self.drawables[edit.index].move_by(delta),
+            ObjectEditAction::Resize(handle) => self.drawables[edit.index].resize(handle, delta),
+        };
+        if changed {
+            self.drawables[edit.index].invalidate_edit_cache();
+        }
+        changed
+    }
+
+    fn find_drawable_at(&self, pos: Vec2D) -> Option<usize> {
+        let tolerance = self.object_hit_tolerance();
+        self.drawables
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, drawable)| {
+                drawable.edit_bounds().is_some() && drawable.hit_test(pos, tolerance)
+            })
+            .map(|(index, _)| index)
+    }
+
+    fn object_hit_tolerance(&self) -> f32 {
+        10.0 / self.scale_factor.max(0.01)
+    }
+
+    fn clear_object_selection(&mut self) {
+        self.selected_drawable = None;
+        self.active_object_edit = None;
     }
 
     pub fn render_native_resolution(
@@ -457,6 +663,10 @@ impl FemtoVgAreaMut {
             d.draw(canvas, font, bounds)?;
         }
 
+        if onscreen && self.active_tool.borrow().get_tool_type() == Tools::Pointer {
+            self.render_object_selection(canvas);
+        }
+
         // render active tool
         if let Some(d) = self.active_tool.borrow().get_drawable() {
             d.draw(canvas, font, bounds)?;
@@ -469,6 +679,21 @@ impl FemtoVgAreaMut {
 
         canvas.flush();
         Ok(())
+    }
+
+    fn render_object_selection(&self, canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl>) {
+        let Some(index) = self.selected_drawable else {
+            return;
+        };
+        let Some(drawable) = self.drawables.get(index) else {
+            return;
+        };
+        let Some(bounds) = drawable.edit_bounds() else {
+            return;
+        };
+
+        edit::draw_bounds(canvas, bounds);
+        edit::draw_handles(canvas, &drawable.edit_handles());
     }
 
     fn render_background_image(
@@ -744,5 +969,136 @@ impl FemtoVgAreaMut {
 
     pub fn set_is_drag(&mut self, is_drag: bool) {
         self.is_drag = is_drag;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::{ToolsManager, edit::ObjectBounds};
+    use relm4::gtk::gdk_pixbuf::Colorspace;
+
+    #[derive(Clone, Debug)]
+    struct TestDrawable {
+        pos: Vec2D,
+        size: Vec2D,
+    }
+
+    impl Drawable for TestDrawable {
+        fn draw(
+            &self,
+            _canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl>,
+            _font: FontId,
+            _bounds: (Vec2D, Vec2D),
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn edit_bounds(&self) -> Option<ObjectBounds> {
+            Some(ObjectBounds::new(self.pos, self.size))
+        }
+
+        fn move_by(&mut self, delta: Vec2D) -> bool {
+            if delta.is_zero() {
+                return false;
+            }
+            self.pos += delta;
+            true
+        }
+    }
+
+    fn test_drawable(x: f32) -> Box<dyn Drawable> {
+        Box::new(TestDrawable {
+            pos: Vec2D::new(x, 0.0),
+            size: Vec2D::new(10.0, 10.0),
+        })
+    }
+
+    fn test_area() -> FemtoVgAreaMut {
+        let tools = ToolsManager::new();
+        FemtoVgAreaMut {
+            background_image: Pixbuf::new(Colorspace::Rgb, false, 8, 1, 1).unwrap(),
+            background_image_id: None,
+            transparent_background_id: None,
+            active_tool: tools.get(&Tools::Pointer),
+            crop_tool: tools.get_crop_tool(),
+            scale_factor: 1.0,
+            offset: Vec2D::zero(),
+            drawables: Vec::new(),
+            history: Vec::new(),
+            redo_history: Vec::new(),
+            selected_drawable: None,
+            active_object_edit: None,
+            zoom_scale: 0.0,
+            last_scale: 0.0,
+            pointer_offset: Vec2D::zero(),
+            last_offset: Vec2D::zero(),
+            drag_offset: Vec2D::zero(),
+            is_drag: false,
+            is_reset: false,
+        }
+    }
+
+    fn drawable_pos(area: &FemtoVgAreaMut, index: usize) -> Vec2D {
+        area.drawables[index].edit_bounds().unwrap().top_left
+    }
+
+    #[test]
+    fn add_history_undo_redo_moves_drawable_between_stacks() {
+        let mut area = test_area();
+
+        area.commit(test_drawable(0.0));
+        assert_eq!(area.drawables.len(), 1);
+
+        assert!(area.undo());
+        assert!(area.drawables.is_empty());
+
+        assert!(area.redo());
+        assert_eq!(area.drawables.len(), 1);
+        assert_eq!(drawable_pos(&area, 0), Vec2D::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn modify_history_undo_redo_restores_snapshots() {
+        let mut area = test_area();
+        area.commit(test_drawable(0.0));
+
+        assert!(area.pointer_begin_drag(Vec2D::new(5.0, 5.0)));
+        assert!(area.pointer_end_drag(Vec2D::new(12.0, 0.0)));
+        assert_eq!(drawable_pos(&area, 0), Vec2D::new(12.0, 0.0));
+
+        assert!(area.undo());
+        assert_eq!(drawable_pos(&area, 0), Vec2D::new(0.0, 0.0));
+
+        assert!(area.redo());
+        assert_eq!(drawable_pos(&area, 0), Vec2D::new(12.0, 0.0));
+    }
+
+    #[test]
+    fn redo_history_is_cleared_after_new_change() {
+        let mut area = test_area();
+        area.commit(test_drawable(0.0));
+
+        assert!(area.pointer_begin_drag(Vec2D::new(5.0, 5.0)));
+        assert!(area.pointer_end_drag(Vec2D::new(12.0, 0.0)));
+        assert!(area.undo());
+
+        area.commit(test_drawable(30.0));
+        assert!(!area.redo());
+    }
+
+    #[test]
+    fn reset_history_restores_drawables_in_order() {
+        let mut area = test_area();
+        area.commit(test_drawable(0.0));
+        area.commit(test_drawable(20.0));
+
+        assert!(area.reset());
+        assert!(area.drawables.is_empty());
+
+        assert!(area.undo());
+        assert_eq!(area.drawables.len(), 2);
+        assert_eq!(drawable_pos(&area, 0), Vec2D::new(0.0, 0.0));
+        assert_eq!(drawable_pos(&area, 1), Vec2D::new(20.0, 0.0));
     }
 }
