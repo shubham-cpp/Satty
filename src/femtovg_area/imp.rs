@@ -457,6 +457,46 @@ impl FemtoVgAreaMut {
         old_selection != self.selected_drawable
     }
 
+    pub fn take_text_edit_at(&mut self, pos: Vec2D) -> Option<(usize, Box<dyn Drawable>)> {
+        self.active_object_edit = None;
+        let index = self.find_drawable_at(pos)?;
+        if !self.drawables.get(index)?.supports_text_edit() {
+            return None;
+        }
+
+        self.selected_drawable = None;
+        Some((index, self.drawables.remove(index)))
+    }
+
+    pub fn restore_drawable(&mut self, index: usize, drawable: Box<dyn Drawable>) {
+        self.clear_object_selection();
+        if index >= self.drawables.len() {
+            self.drawables.push(drawable);
+        } else {
+            self.drawables.insert(index, drawable);
+        }
+    }
+
+    pub fn modify_drawable(
+        &mut self,
+        index: usize,
+        before: Box<dyn Drawable>,
+        after: Box<dyn Drawable>,
+    ) {
+        self.clear_object_selection();
+        if index >= self.drawables.len() {
+            self.drawables.push(after.edit_snapshot());
+        } else {
+            self.drawables.insert(index, after.edit_snapshot());
+        }
+        self.history.push(HistoryAction::Modify {
+            index,
+            before,
+            after,
+        });
+        self.redo_history.clear();
+    }
+
     pub fn pointer_begin_drag(&mut self, pos: Vec2D) -> bool {
         self.active_object_edit = None;
         let tolerance = self.object_hit_tolerance();
@@ -985,6 +1025,10 @@ mod tests {
     }
 
     impl Drawable for TestDrawable {
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+            self
+        }
+
         fn draw(
             &self,
             _canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl>,

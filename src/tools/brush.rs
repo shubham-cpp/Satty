@@ -37,6 +37,10 @@ impl BrushDrawable {
 }
 
 impl Drawable for BrushDrawable {
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+
     fn draw(
         &self,
         canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl>,

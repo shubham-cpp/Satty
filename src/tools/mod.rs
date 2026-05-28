@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     borrow::Cow,
     cell::RefCell,
     collections::HashMap,
@@ -116,6 +117,11 @@ pub trait Tool {
         ToolUpdateResult::Unmodified
     }
 
+    fn start_existing_text_edit(&mut self, drawable: Box<dyn Drawable>, index: usize) -> bool {
+        let _ = (drawable, index);
+        false
+    }
+
     fn set_im_context(&mut self, _context: Option<InputContext>) {}
 
     fn get_drawable(&self) -> Option<&dyn Drawable>;
@@ -146,7 +152,8 @@ where
     }
 }
 
-pub trait Drawable: DrawableClone + Debug {
+pub trait Drawable: DrawableClone + Debug + Any {
+    fn into_any(self: Box<Self>) -> Box<dyn Any>;
     fn draw(&self, canvas: &mut Canvas<OpenGl>, font: FontId, bounds: (Vec2D, Vec2D))
     -> Result<()>;
     fn handle_undo(&mut self) {}
@@ -175,11 +182,23 @@ pub trait Drawable: DrawableClone + Debug {
     fn edit_snapshot(&self) -> Box<dyn Drawable> {
         self.clone_box()
     }
+    fn supports_text_edit(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
 pub enum ToolUpdateResult {
     Commit(Box<dyn Drawable>),
+    Modify {
+        index: usize,
+        before: Box<dyn Drawable>,
+        after: Box<dyn Drawable>,
+    },
+    Restore {
+        index: usize,
+        drawable: Box<dyn Drawable>,
+    },
     Redraw,
     Unmodified,
     StopPropagation,

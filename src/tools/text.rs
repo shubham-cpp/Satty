@@ -19,14 +19,17 @@ use crate::{
     style::Style,
 };
 
-use super::{Drawable, DrawableClone, InputContext, Tool, ToolUpdateResult, Tools};
+use super::{
+    Drawable, DrawableClone, InputContext, Tool, ToolUpdateResult, Tools,
+    edit::{EditHandle, ObjectBounds},
+};
 use crate::sketch_board::SketchBoardInput;
 use relm4::Sender;
 use relm4::gtk::gdk::DisplayManager;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Text {
     pos: Vec2D,
     editing: bool,
@@ -40,6 +43,29 @@ pub struct Text {
     cursor_visible: RefCell<bool>,
     draw_rect: RefCell<bool>,
     font_ids: Vec<FontId>,
+}
+
+impl Clone for Text {
+    fn clone(&self) -> Self {
+        let text_buffer = TextBuffer::new(None);
+        text_buffer.set_enable_undo(true);
+        text_buffer.set_text(self.get_text().as_str());
+
+        Self {
+            pos: self.pos,
+            editing: self.editing,
+            text_buffer,
+            style: self.style,
+            preedit: None,
+            im_context: self.im_context.clone(),
+            rect: RefCell::new(*self.rect.borrow()),
+            glyphs: RefCell::new(self.glyphs.borrow().clone()),
+            line_ranges: RefCell::new(self.line_ranges.borrow().clone()),
+            cursor_visible: RefCell::new(*self.cursor_visible.borrow()),
+            draw_rect: RefCell::new(*self.draw_rect.borrow()),
+            font_ids: self.font_ids.clone(),
+        }
+    }
 }
 
 struct DisplayContent<'a> {
@@ -150,9 +176,52 @@ impl Text {
             false,
         )
     }
+
+    fn fixed_pivot_for_handle(bounds: ObjectBounds, handle: EditHandle) -> Option<Vec2D> {
+        match handle {
+            EditHandle::TopLeft => bounds.handle_position(EditHandle::BottomRight),
+            EditHandle::Top => bounds.handle_position(EditHandle::Bottom),
+            EditHandle::TopRight => bounds.handle_position(EditHandle::BottomLeft),
+            EditHandle::Right => bounds.handle_position(EditHandle::Left),
+            EditHandle::BottomRight => bounds.handle_position(EditHandle::TopLeft),
+            EditHandle::Bottom => bounds.handle_position(EditHandle::Top),
+            EditHandle::BottomLeft => bounds.handle_position(EditHandle::TopRight),
+            EditHandle::Left => bounds.handle_position(EditHandle::Right),
+            EditHandle::Start | EditHandle::End => None,
+        }
+    }
+
+    fn resize_scale_for_handle(bounds: ObjectBounds, handle: EditHandle, delta: Vec2D) -> f32 {
+        let Some(handle_pos) = bounds.handle_position(handle) else {
+            return 1.0;
+        };
+        let Some(pivot) = Self::fixed_pivot_for_handle(bounds, handle) else {
+            return 1.0;
+        };
+
+        let old_vector = handle_pos - pivot;
+        let new_vector = handle_pos + delta - pivot;
+        let length2 = old_vector.norm2();
+        if length2 <= f32::EPSILON {
+            return 1.0;
+        }
+
+        (new_vector.x * old_vector.x + new_vector.y * old_vector.y) / length2
+    }
+
+    fn scaled_origin(bounds: ObjectBounds, origin: Vec2D, handle: EditHandle, scale: f32) -> Vec2D {
+        let Some(pivot) = Self::fixed_pivot_for_handle(bounds, handle) else {
+            return origin;
+        };
+        pivot + (origin - pivot) * scale
+    }
 }
 
 impl Drawable for Text {
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
+    }
+
     fn draw(
         &self,
         canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl>,
@@ -387,6 +456,71 @@ impl Drawable for Text {
         }
 
         Ok(())
+    }
+
+    fn edit_bounds(&self) -> Option<ObjectBounds> {
+        let rect = self.rect.borrow();
+        if rect.width() <= 0 || rect.height() <= 0 {
+            return None;
+        }
+
+        Some(ObjectBounds::new(
+            Vec2D::new(rect.x() as f32, rect.y() as f32),
+            Vec2D::new(rect.width() as f32, rect.height() as f32),
+        ))
+    }
+
+    fn hit_test(&self, pos: Vec2D, tolerance: f32) -> bool {
+        self.edit_bounds()
+            .is_some_and(|bounds| bounds.contains(pos, tolerance))
+    }
+
+    fn move_by(&mut self, delta: Vec2D) -> bool {
+        if delta.is_zero() {
+            return false;
+        }
+
+        self.pos += delta;
+        true
+    }
+
+    fn resize(&mut self, handle: EditHandle, delta: Vec2D) -> bool {
+        let Some(bounds) = self.edit_bounds() else {
+            return false;
+        };
+
+        let current_size = self
+            .style
+            .size
+            .to_text_size(self.style.annotation_size_factor) as f32;
+        let scale = Self::resize_scale_for_handle(bounds, handle, delta);
+        if !scale.is_finite() || scale <= 0.0 {
+            return false;
+        }
+
+        let new_size = (current_size * scale).clamp(8.0, 512.0);
+        let base_size = self.style.size.to_text_size(1.0) as f32;
+        if base_size <= f32::EPSILON {
+            return false;
+        }
+
+        let new_factor = new_size / base_size;
+        if (new_factor - self.style.annotation_size_factor).abs() <= f32::EPSILON {
+            return false;
+        }
+
+        let applied_scale = new_size / current_size;
+        self.style.annotation_size_factor = new_factor;
+        self.pos = Self::scaled_origin(bounds, self.pos, handle, applied_scale);
+        true
+    }
+
+    fn edit_snapshot(&self) -> Box<dyn Drawable> {
+        Box::new(self.clone())
+    }
+
+    fn supports_text_edit(&self) -> bool {
+        true
     }
 }
 
@@ -704,12 +838,18 @@ impl Text {
 #[derive(Default)]
 pub struct TextTool {
     text: Option<Text>,
+    existing_edit: Option<ExistingTextEdit>,
     style: Style,
     input_enabled: bool,
     im_context: Option<InputContext>,
     sender: Option<Sender<SketchBoardInput>>,
     drag_start_pos: Vec2D,
     dragged: Rc<RefCell<bool>>,
+}
+
+struct ExistingTextEdit {
+    index: usize,
+    original: Text,
 }
 
 impl Tool for TextTool {
@@ -730,6 +870,29 @@ impl Tool for TextTool {
         if let Some(text) = &mut self.text {
             text.im_context = context;
         }
+    }
+
+    fn start_existing_text_edit(&mut self, drawable: Box<dyn Drawable>, index: usize) -> bool {
+        let Ok(text) = drawable.into_any().downcast::<Text>() else {
+            return false;
+        };
+
+        let original = *text;
+        let mut editing = original.clone();
+        editing.editing = true;
+        editing.preedit = None;
+        editing.im_context = self.im_context.clone();
+        editing.text_buffer.select_range(
+            &editing.text_buffer.start_iter(),
+            &editing.text_buffer.end_iter(),
+        );
+        *editing.draw_rect.borrow_mut() = true;
+
+        self.style = editing.style;
+        self.text = Some(editing);
+        self.existing_edit = Some(ExistingTextEdit { index, original });
+        self.input_enabled = true;
+        true
     }
 
     fn get_drawable(&self) -> Option<&dyn Drawable> {
@@ -805,25 +968,7 @@ impl Tool for TextTool {
                         tool_update_result = ToolUpdateResult::RedrawAndStopPropagation;
                     }
                     _ => {
-                        let content = t.get_text();
-                        if content.is_empty() {
-                            self.text = None;
-                            self.input_enabled = false;
-                            tool_update_result = ToolUpdateResult::RedrawAndStopPropagation;
-                        } else {
-                            t.preedit = None;
-                            t.editing = false;
-                            t.im_context = None;
-                            t.text_buffer.select_range(
-                                &t.text_buffer.start_iter(),
-                                &t.text_buffer.start_iter(),
-                            );
-                            *t.draw_rect.borrow_mut() = false;
-                            let result = t.clone_box();
-                            self.text = None;
-                            self.input_enabled = false;
-                            tool_update_result = ToolUpdateResult::Commit(result);
-                        }
+                        tool_update_result = self.finish_text_edit();
                     }
                 },
                 Key::Escape => {
@@ -1146,25 +1291,17 @@ impl Tool for TextTool {
                         }
 
                         // create commit message if necessary
-                        let return_value = match &mut self.text {
-                            Some(l) => {
-                                let content = l.get_text();
-                                if content.is_empty() {
-                                    ToolUpdateResult::Unmodified
-                                } else {
-                                    l.preedit = None;
-                                    l.editing = false;
-                                    l.im_context = None;
-                                    l.text_buffer.select_range(
-                                        &l.text_buffer.start_iter(),
-                                        &l.text_buffer.start_iter(),
-                                    );
-                                    *l.draw_rect.borrow_mut() = false;
-                                    ToolUpdateResult::Commit(l.clone_box())
-                                }
-                            }
-                            None => ToolUpdateResult::Redraw,
+                        let return_value = if self.text.is_some() {
+                            self.finish_text_edit()
+                        } else {
+                            ToolUpdateResult::Redraw
                         };
+                        if matches!(
+                            return_value,
+                            ToolUpdateResult::Modify { .. } | ToolUpdateResult::Restore { .. }
+                        ) {
+                            return return_value;
+                        }
 
                         // create a new Text
                         self.text = Some(Text::new(event.pos, self.style, self.im_context.clone()));
@@ -1291,28 +1428,7 @@ impl Tool for TextTool {
     }
 
     fn handle_deactivated(&mut self) -> ToolUpdateResult {
-        self.input_enabled = false;
-        if let Some(t) = &mut self.text {
-            let content = t.get_text();
-            if content.is_empty() {
-                // Don't create empty text objects
-                self.text = None;
-                ToolUpdateResult::Unmodified
-            } else {
-                t.preedit = None;
-                t.editing = false;
-                t.im_context = None;
-                t.text_buffer
-                    .select_range(&t.text_buffer.start_iter(), &t.text_buffer.start_iter());
-                *t.draw_rect.borrow_mut() = false;
-                let result = t.clone_box();
-                self.text = None;
-                self.input_enabled = false;
-                ToolUpdateResult::Commit(result)
-            }
-        } else {
-            ToolUpdateResult::Unmodified
-        }
+        self.finish_text_edit()
     }
 
     fn active(&self) -> bool {
@@ -1369,6 +1485,56 @@ enum Action {
 }
 
 impl TextTool {
+    fn finish_text_edit(&mut self) -> ToolUpdateResult {
+        self.input_enabled = false;
+        let Some(mut text) = self.text.take() else {
+            self.existing_edit = None;
+            return ToolUpdateResult::Unmodified;
+        };
+
+        let content = text.get_text();
+        let existing_edit = self.existing_edit.take();
+
+        if content.is_empty() {
+            return if let Some(edit) = existing_edit {
+                ToolUpdateResult::Restore {
+                    index: edit.index,
+                    drawable: edit.original.clone_box(),
+                }
+            } else {
+                ToolUpdateResult::RedrawAndStopPropagation
+            };
+        }
+
+        text.preedit = None;
+        text.editing = false;
+        text.im_context = None;
+        text.text_buffer.select_range(
+            &text.text_buffer.start_iter(),
+            &text.text_buffer.start_iter(),
+        );
+        *text.draw_rect.borrow_mut() = false;
+
+        if let Some(edit) = existing_edit {
+            let after = text.clone_box();
+            let before = edit.original.clone_box();
+            if format!("{before:?}") == format!("{after:?}") {
+                ToolUpdateResult::Restore {
+                    index: edit.index,
+                    drawable: before,
+                }
+            } else {
+                ToolUpdateResult::Modify {
+                    index: edit.index,
+                    before,
+                    after,
+                }
+            }
+        } else {
+            ToolUpdateResult::Commit(text.clone_box())
+        }
+    }
+
     fn handle_text_buffer_action(
         text: &mut Text,
         action: Action,
@@ -1731,5 +1897,66 @@ impl TextTool {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_corner_resize_uses_dominant_axis_for_uniform_scale() {
+        let bounds = ObjectBounds::new(Vec2D::new(10.0, 20.0), Vec2D::new(100.0, 50.0));
+
+        let scale =
+            Text::resize_scale_for_handle(bounds, EditHandle::BottomRight, Vec2D::new(60.0, 5.0));
+
+        assert!((scale - 1.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn text_left_resize_keeps_right_edge_anchored() {
+        let bounds = ObjectBounds::new(Vec2D::new(10.0, 20.0), Vec2D::new(100.0, 50.0));
+        let origin = Vec2D::new(10.0, 58.0);
+
+        let scaled_origin = Text::scaled_origin(bounds, origin, EditHandle::Left, 1.5);
+
+        assert_eq!(scaled_origin, Vec2D::new(-40.0, 64.5));
+    }
+
+    #[test]
+    fn text_top_left_resize_keeps_bottom_right_anchored() {
+        let bounds = ObjectBounds::new(Vec2D::new(10.0, 20.0), Vec2D::new(100.0, 50.0));
+        let origin = Vec2D::new(10.0, 58.0);
+
+        let scaled_origin = Text::scaled_origin(bounds, origin, EditHandle::TopLeft, 0.5);
+
+        assert_eq!(scaled_origin, Vec2D::new(60.0, 64.0));
+    }
+
+    #[test]
+    fn text_resize_scales_baseline_origin_relative_to_visual_bounds() {
+        let bounds = ObjectBounds::new(Vec2D::new(10.0, 20.0), Vec2D::new(100.0, 50.0));
+        let origin = Vec2D::new(10.0, 58.0);
+
+        let scaled_origin = Text::scaled_origin(bounds, origin, EditHandle::BottomRight, 2.0);
+
+        assert_eq!(scaled_origin, Vec2D::new(10.0, 96.0));
+    }
+
+    #[test]
+    fn text_clone_uses_independent_buffer() {
+        if relm4::gtk::init().is_err() {
+            return;
+        }
+
+        let text = Text::new(Vec2D::zero(), Style::default(), None);
+        text.text_buffer.set_text("before");
+        let cloned = text.clone();
+
+        text.text_buffer.set_text("after");
+
+        assert_eq!(cloned.get_text().as_str(), "before");
+        assert_eq!(text.get_text().as_str(), "after");
     }
 }

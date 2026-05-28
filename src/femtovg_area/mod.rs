@@ -178,6 +178,35 @@ impl FemtoVGArea {
             .pointer_click(pos)
     }
 
+    pub fn take_text_edit_at(&self, pos: Vec2D) -> Option<(usize, Box<dyn Drawable>)> {
+        self.imp()
+            .inner()
+            .as_mut()
+            .expect("Did you call init before using FemtoVgArea?")
+            .take_text_edit_at(pos)
+    }
+
+    pub fn restore_drawable(&self, index: usize, drawable: Box<dyn Drawable>) {
+        self.imp()
+            .inner()
+            .as_mut()
+            .expect("Did you call init before using FemtoVgArea?")
+            .restore_drawable(index, drawable);
+    }
+
+    pub fn modify_drawable(
+        &self,
+        index: usize,
+        before: Box<dyn Drawable>,
+        after: Box<dyn Drawable>,
+    ) {
+        self.imp()
+            .inner()
+            .as_mut()
+            .expect("Did you call init before using FemtoVgArea?")
+            .modify_drawable(index, before, after);
+    }
+
     pub fn pointer_begin_drag(&self, pos: Vec2D) -> bool {
         self.imp()
             .inner()

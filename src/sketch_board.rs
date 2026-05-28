@@ -269,14 +269,50 @@ impl SketchBoard {
     }
 
     fn deactivate_active_tool(&mut self) -> bool {
-        if self.active_tool.borrow().active()
-            && let ToolUpdateResult::Commit(result) =
-                self.active_tool.borrow_mut().handle_deactivated()
-        {
-            self.renderer.commit(result);
-            return true;
+        if self.active_tool.borrow().active() {
+            let result = self.active_tool.borrow_mut().handle_deactivated();
+            return !matches!(
+                self.apply_tool_update_result(result),
+                ToolUpdateResult::Unmodified | ToolUpdateResult::StopPropagation
+            );
         }
         false
+    }
+
+    fn apply_tool_update_result(&mut self, result: ToolUpdateResult) -> ToolUpdateResult {
+        match result {
+            ToolUpdateResult::Commit(drawable) => {
+                self.renderer.commit(drawable);
+                if APP_CONFIG.read().auto_copy() {
+                    self.renderer.request_render(&[Action::SaveToClipboard]);
+                }
+                ToolUpdateResult::Redraw
+            }
+            ToolUpdateResult::Modify {
+                index,
+                before,
+                after,
+            } => {
+                self.renderer.modify_drawable(index, before, after);
+                self.return_to_pointer_tool();
+                if APP_CONFIG.read().auto_copy() {
+                    self.renderer.request_render(&[Action::SaveToClipboard]);
+                }
+                ToolUpdateResult::Redraw
+            }
+            ToolUpdateResult::Restore { index, drawable } => {
+                self.renderer.restore_drawable(index, drawable);
+                self.return_to_pointer_tool();
+                ToolUpdateResult::Redraw
+            }
+            other => other,
+        }
+    }
+
+    fn return_to_pointer_tool(&mut self) {
+        self.active_tool.borrow_mut().set_im_context(None);
+        self.active_tool = self.tools.get(&Tools::Pointer);
+        self.renderer.set_active_tool(self.active_tool.clone());
     }
 
     fn handle_action(&mut self, actions: &[Action]) -> ToolUpdateResult {
@@ -773,14 +809,7 @@ impl SketchBoard {
 
                 old_tool.borrow_mut().set_im_context(None);
 
-                if let ToolUpdateResult::Commit(d) = deactivate_result {
-                    self.renderer.commit(d);
-                    if APP_CONFIG.read().auto_copy() {
-                        self.renderer.request_render(&[Action::SaveToClipboard]);
-                    }
-                    // we handle commit directly and "downgrade" to a simple redraw result
-                    deactivate_result = ToolUpdateResult::Redraw;
-                }
+                deactivate_result = self.apply_tool_update_result(deactivate_result);
 
                 // change active tool
                 self.active_tool = self.tools.get(&tool);
@@ -930,7 +959,11 @@ impl SketchBoard {
         self.active_tool.borrow().get_tool_type()
     }
 
-    fn handle_pointer_object_event(&self, event: &InputEvent) -> Option<ToolUpdateResult> {
+    fn handle_pointer_object_event(
+        &mut self,
+        event: &InputEvent,
+        sender: &ComponentSender<Self>,
+    ) -> Option<ToolUpdateResult> {
         if self.active_tool_type() != Tools::Pointer {
             return None;
         }
@@ -943,6 +976,33 @@ impl SketchBoard {
         }
 
         match event.type_ {
+            MouseEventType::Click if event.n_pressed == 2 => {
+                let (index, drawable) = self.renderer.take_text_edit_at(event.pos)?;
+
+                self.active_tool.borrow_mut().set_im_context(None);
+                self.active_tool = self.tools.get(&Tools::Text);
+                self.renderer.set_active_tool(self.active_tool.clone());
+                let widget_ref: gtk::Widget = self.renderer.clone().upcast();
+                self.active_tool
+                    .borrow_mut()
+                    .set_im_context(Some(crate::tools::InputContext {
+                        im_context: self.im_context.clone(),
+                        widget: widget_ref,
+                    }));
+                self.active_tool
+                    .borrow_mut()
+                    .set_sender(sender.input_sender().clone());
+
+                if self
+                    .active_tool
+                    .borrow_mut()
+                    .start_existing_text_edit(drawable, index)
+                {
+                    Some(ToolUpdateResult::RedrawAndStopPropagation)
+                } else {
+                    None
+                }
+            }
             MouseEventType::Click => self
                 .renderer
                 .pointer_click(event.pos)
@@ -1215,13 +1275,12 @@ impl Component for SketchBoard {
                     }
                 } else {
                     ie.handle_event_mouse_input(&self.renderer);
-                    if let Some(result) = self.handle_pointer_object_event(&ie) {
+                    if let Some(result) = self.handle_pointer_object_event(&ie, &sender) {
                         return match result {
-                            ToolUpdateResult::Commit(drawable) => {
-                                self.renderer.commit(drawable);
-                                if APP_CONFIG.read().auto_copy() {
-                                    self.renderer.request_render(&[Action::SaveToClipboard]);
-                                }
+                            ToolUpdateResult::Commit(_)
+                            | ToolUpdateResult::Modify { .. }
+                            | ToolUpdateResult::Restore { .. } => {
+                                self.apply_tool_update_result(result);
                                 self.refresh_screen();
                             }
                             ToolUpdateResult::Unmodified | ToolUpdateResult::StopPropagation => (),
@@ -1283,14 +1342,10 @@ impl Component for SketchBoard {
         };
 
         // println!(" Result={:?}", result);
-        match result {
-            ToolUpdateResult::Commit(drawable) => {
-                self.renderer.commit(drawable);
-                if APP_CONFIG.read().auto_copy() {
-                    self.renderer.request_render(&[Action::SaveToClipboard]);
-                }
-                self.refresh_screen();
-            }
+        match self.apply_tool_update_result(result) {
+            ToolUpdateResult::Commit(_)
+            | ToolUpdateResult::Modify { .. }
+            | ToolUpdateResult::Restore { .. } => unreachable!("tool results are normalized"),
             ToolUpdateResult::Unmodified | ToolUpdateResult::StopPropagation => (),
             ToolUpdateResult::Redraw | ToolUpdateResult::RedrawAndStopPropagation => {
                 self.refresh_screen()
