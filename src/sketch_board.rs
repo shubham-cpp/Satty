@@ -23,6 +23,7 @@ use crate::femtovg_area::FemtoVGArea;
 use crate::ime::pango_adapter::spans_from_pango_attrs;
 use crate::math::Vec2D;
 use crate::notification::log_result;
+use crate::profiling;
 use crate::style::Style;
 use crate::tools::{StyleChange, Tool, ToolEvent, ToolUpdateResult, Tools, ToolsManager};
 use crate::ui::toolbars::ToolbarEvent;
@@ -1478,10 +1479,17 @@ impl Component for SketchBoard {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
+        let _profile = profiling::scope("SketchBoard::init");
         let config = APP_CONFIG.read();
-        let tools = ToolsManager::new();
+        let tools = {
+            let _profile = profiling::scope("ToolsManager::new");
+            ToolsManager::new()
+        };
 
-        let im_context = gtk::IMMulticontext::new();
+        let im_context = {
+            let _profile = profiling::scope("gtk::IMMulticontext::new");
+            gtk::IMMulticontext::new()
+        };
 
         let mut model = Self {
             renderer: FemtoVGArea::default(),
@@ -1494,14 +1502,19 @@ impl Component for SketchBoard {
         };
 
         let area = &mut model.renderer;
-        area.init(
-            sender.input_sender().clone(),
-            model.tools.get_crop_tool(),
-            model.active_tool.clone(),
-            image,
-        );
+        {
+            let _profile = profiling::scope("FemtoVGArea::init");
+            area.init(
+                sender.input_sender().clone(),
+                model.tools.get_crop_tool(),
+                model.active_tool.clone(),
+                image,
+            );
+        }
 
+        let profile = profiling::scope("SketchBoard view_output");
         let widgets = view_output!();
+        drop(profile);
 
         model.im_context.set_client_widget(Some(&model.renderer));
         model.im_context.set_use_preedit(true);

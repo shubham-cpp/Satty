@@ -188,6 +188,9 @@ impl Drawable for Arrow {
 
         let arrow_offset = end - self.start;
         let arrow_length = arrow_offset.norm();
+        if arrow_length <= f32::EPSILON {
+            return Ok(());
+        }
         let arrow_direction = arrow_offset * (1.0 / arrow_length);
 
         // We rotate the canvas so that we can draw the arrow on the x-axis.
@@ -298,5 +301,61 @@ impl Drawable for Arrow {
 
     fn apply_style_change(&mut self, change: StyleChange) -> bool {
         apply_style_change_to_style(&mut self.style, change)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::style::{Color, Size};
+
+    use super::*;
+
+    fn test_arrow() -> Arrow {
+        Arrow {
+            start: Vec2D::new(10.0, 20.0),
+            end: Some(Vec2D::new(30.0, 40.0)),
+            style: Style {
+                color: Color::red(),
+                size: Size::Medium,
+                fill: false,
+                annotation_size_factor: 1.0,
+            },
+        }
+    }
+
+    #[test]
+    fn arrow_edit_handles_are_start_and_end_points() {
+        let arrow = test_arrow();
+
+        assert_eq!(
+            arrow.edit_handles(),
+            vec![
+                (EditHandle::Start, Vec2D::new(10.0, 20.0)),
+                (EditHandle::End, Vec2D::new(30.0, 40.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn arrow_move_by_moves_both_endpoints() {
+        let mut arrow = test_arrow();
+
+        assert!(arrow.move_by(Vec2D::new(5.0, -10.0)));
+
+        assert_eq!(arrow.start, Vec2D::new(15.0, 10.0));
+        assert_eq!(arrow.end, Some(Vec2D::new(35.0, 30.0)));
+    }
+
+    #[test]
+    fn arrow_resize_moves_start_or_end_endpoint() {
+        let mut arrow = test_arrow();
+
+        assert!(arrow.resize(EditHandle::Start, Vec2D::new(-5.0, 10.0)));
+        assert_eq!(arrow.start, Vec2D::new(5.0, 30.0));
+        assert_eq!(arrow.end, Some(Vec2D::new(30.0, 40.0)));
+
+        assert!(arrow.resize(EditHandle::End, Vec2D::new(10.0, -5.0)));
+        assert_eq!(arrow.start, Vec2D::new(5.0, 30.0));
+        assert_eq!(arrow.end, Some(Vec2D::new(40.0, 35.0)));
     }
 }

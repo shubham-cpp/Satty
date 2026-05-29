@@ -1,13 +1,14 @@
 use configuration::{APP_CONFIG, Configuration};
+use std::io;
 use std::io::Read;
 use std::ops::Deref;
 use std::process::exit;
 use std::sync::LazyLock;
+use std::time::Duration;
 use std::{fs, ptr};
-use std::{io, time::Duration};
 
 use relm4::gtk::gdk_pixbuf::{Pixbuf, PixbufLoader};
-use relm4::gtk::gio::{Application, ApplicationFlags};
+use relm4::gtk::gio::{Application as GioApplication, ApplicationFlags};
 use relm4::gtk::prelude::*;
 
 use relm4::gtk::gdk::Rectangle;
@@ -30,6 +31,7 @@ mod icons;
 mod ime;
 mod math;
 mod notification;
+mod profiling;
 mod sketch_board;
 mod style;
 mod tools;
@@ -43,13 +45,7 @@ pub static START_TIME: LazyLock<chrono::DateTime<chrono::Local>> =
 
 macro_rules! generate_profile_output {
     ($e: expr) => {
-        if (APP_CONFIG.read().profile_startup()) {
-            eprintln!(
-                "{:5} ms time elapsed: {}",
-                (chrono::Local::now() - *START_TIME).num_milliseconds(),
-                $e
-            );
-        }
+        crate::profiling::mark($e);
     };
 }
 
@@ -90,6 +86,7 @@ impl App {
     }
 
     fn resize_window_initial(&self, root: &Window, sender: ComponentSender<Self>) {
+        let _profile = profiling::scope("resize_window_initial");
         let config = APP_CONFIG.read();
         let scale = config.input_scale().unwrap_or(1.0);
         let fullscreen = config.fullscreen();
@@ -99,9 +96,12 @@ impl App {
         let image_width = (self.image_dimensions.0 as f32 / scale) as f64;
         let image_height = (self.image_dimensions.1 as f32 / scale) as f64;
 
-        eprintln!(
-            "Fullscreen {:?} | Resize {:?} | Floatinghack {:?}",
-            fullscreen, resize, floating_hack
+        profiling::mark_detail(
+            "resize_window_initial mode",
+            format!(
+                "fullscreen={fullscreen:?}, resize={resize:?}, floating_hack={floating_hack}, image={}x{}, scale={scale}",
+                self.image_dimensions.0, self.image_dimensions.1
+            ),
         );
 
         if fullscreen == Some(Fullscreen::All)
@@ -192,7 +192,7 @@ impl App {
                     gtk::style_context_add_provider_for_display(&display, &css_provider2, 1)
                 }
             }
-            None => println!("Cannot apply style"),
+            None => eprintln!("Cannot apply style"),
         }
     }
 }
@@ -313,11 +313,20 @@ impl Component for App {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        Self::apply_style();
+        let _profile = profiling::scope("App::init");
+        {
+            let _profile = profiling::scope("App::apply_style");
+            Self::apply_style();
+        }
         let image_dimensions = (image.width(), image.height());
+        profiling::mark_detail(
+            "App::init image dimensions",
+            format!("{}x{}", image_dimensions.0, image_dimensions.1),
+        );
 
         // SketchBoard
-        let sketch_board =
+        let sketch_board = {
+            let _profile = profiling::scope("SketchBoard launch");
             SketchBoard::builder()
                 .launch(image)
                 .forward(sender.input_sender(), |t| match t {
@@ -331,16 +340,23 @@ impl Component for App {
                     SketchBoardOutput::DimensionsUpdate(dimensions) => {
                         AppInput::DimensionsUpdate(dimensions)
                     }
-                });
+                })
+        };
 
         // Toolbars
-        let tools_toolbar = ToolsToolbar::builder()
-            .launch(())
-            .forward(sketch_board.sender(), SketchBoardInput::ToolbarEvent);
+        let tools_toolbar = {
+            let _profile = profiling::scope("ToolsToolbar launch");
+            ToolsToolbar::builder()
+                .launch(())
+                .forward(sketch_board.sender(), SketchBoardInput::ToolbarEvent)
+        };
 
-        let style_toolbar = StyleToolbar::builder()
-            .launch(())
-            .forward(sketch_board.sender(), SketchBoardInput::ToolbarEvent);
+        let style_toolbar = {
+            let _profile = profiling::scope("StyleToolbar launch");
+            StyleToolbar::builder()
+                .launch(())
+                .forward(sketch_board.sender(), SketchBoardInput::ToolbarEvent)
+        };
 
         let outer_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         let outer_box_clone = outer_box.clone();
@@ -363,7 +379,9 @@ impl Component for App {
             .sender()
             .emit(StyleToolbarInput::DimensionsChanged(image_dimensions));
 
+        let profile = profiling::scope("App view_output");
         let widgets = view_output!();
+        drop(profile);
 
         if APP_CONFIG.read().focus_toggles_toolbars() {
             let motion_controller = gtk::EventControllerMotion::builder().build();
@@ -383,9 +401,11 @@ impl Component for App {
 
         let sender_clone = sender.clone();
         root.connect_map(move |r| {
+            profiling::mark("window map event");
             let sender_clone = sender_clone.clone();
             if let Some(surface) = r.surface() {
                 surface.connect_notify_local(Some("scale-factor"), move |_, _| {
+                    profiling::mark("surface scale-factor changed");
                     sender_clone.input(AppInput::ScaleFactorChanged);
                 });
             }
@@ -394,8 +414,10 @@ impl Component for App {
         let sender_clone = sender.clone();
         root.connect_notify(Some("fullscreened"), move |window, _| {
             if window.is_fullscreen() {
+                profiling::mark("window fullscreened true");
                 sender_clone.input(AppInput::FullscreenChanged(true));
             } else {
+                profiling::mark("window fullscreened false");
                 sender_clone.input(AppInput::FullscreenChanged(false));
             }
         });
@@ -415,10 +437,6 @@ fn read_css_overrides() -> Option<String> {
     let path = dirs.get_config_file("overrides.css")?;
 
     if !path.exists() {
-        eprintln!(
-            "CSS overrides file {} does not exist, using builtin CSS only.",
-            &path.display()
-        );
         return None;
     }
 
@@ -456,7 +474,10 @@ fn load_gl() -> Result<()> {
 
 fn run_satty() -> Result<()> {
     // load OpenGL
-    load_gl()?;
+    {
+        let _profile = profiling::scope("load_gl");
+        load_gl()?;
+    }
     generate_profile_output!("loaded gl");
 
     // load app config
@@ -466,22 +487,48 @@ fn run_satty() -> Result<()> {
     // load input image
     let image = if config.input_filename() == "-" {
         let mut buf = Vec::<u8>::new();
-        io::stdin().lock().read_to_end(&mut buf)?;
-        let pb_loader = PixbufLoader::new();
-        pb_loader.write(&buf)?;
-        pb_loader.close()?;
+        {
+            let _profile = profiling::scope("stdin read_to_end");
+            io::stdin().lock().read_to_end(&mut buf)?;
+        }
+        profiling::mark_detail("stdin bytes read", buf.len().to_string());
+        let pb_loader = {
+            let _profile = profiling::scope("PixbufLoader::new");
+            PixbufLoader::new()
+        };
+        {
+            let _profile =
+                profiling::scope_detail("PixbufLoader::write", format!("{} bytes", buf.len()));
+            pb_loader.write(&buf)?;
+        }
+        {
+            let _profile = profiling::scope("PixbufLoader::close");
+            pb_loader.close()?;
+        }
         pb_loader
             .pixbuf()
             .ok_or(anyhow!("Conversion to Pixbuf failed"))?
     } else {
+        let _profile =
+            profiling::scope_detail("Pixbuf::from_file", config.input_filename().to_owned());
         Pixbuf::from_file(config.input_filename()).context("couldn't load image")?
     };
+    profiling::mark_detail(
+        "image decoded",
+        format!(
+            "{}x{}, has_alpha={}, rowstride={}",
+            image.width(),
+            image.height(),
+            image.has_alpha(),
+            image.rowstride()
+        ),
+    );
 
     generate_profile_output!("image loaded, starting gui");
     // start GUI
-    let app = relm4::main_application();
+    let app = gtk::Application::default();
     let app_id = match config.app_id() {
-        Some(app_id) if Application::id_is_valid(app_id) => Some(app_id.deref()),
+        Some(app_id) if GioApplication::id_is_valid(app_id) => Some(app_id.deref()),
         o => {
             if let Some(app_id) = o {
                 eprintln!("Invalid app id: {}, using fallback", app_id);
@@ -493,20 +540,29 @@ fn run_satty() -> Result<()> {
     // set flag to allow to run multiple instances
     app.set_flags(ApplicationFlags::NON_UNIQUE);
     // create relm app and run
-    let app = RelmApp::from_app(app).with_args(vec![]);
-    relm4_icons::initialize_icons(
-        icons::icon_names::GRESOURCE_BYTES,
-        icons::icon_names::RESOURCE_PREFIX,
-    );
+    let app = {
+        let _profile = profiling::scope("RelmApp::from_app");
+        RelmApp::from_app(app).with_args(vec![])
+    };
+    {
+        let _profile = profiling::scope("relm4_icons::initialize_icons");
+        relm4_icons::initialize_icons(
+            icons::icon_names::GRESOURCE_BYTES,
+            icons::icon_names::RESOURCE_PREFIX,
+        );
+    }
+    profiling::mark("RelmApp::run starting");
     app.run::<App>(image);
     Ok(())
 }
 
 fn main() -> Result<()> {
     let _ = *START_TIME;
+    profiling::init();
     // populate the APP_CONFIG from commandline and
     // config file. this might exit, if an error occurred.
     Configuration::load();
+    profiling::set_enabled(APP_CONFIG.read().profile_startup());
     if APP_CONFIG.read().man() {
         print!(include_str!(concat!(env!("OUT_DIR"), "/satty.1")));
         exit(0);

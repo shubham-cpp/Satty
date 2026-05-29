@@ -1,7 +1,8 @@
 use anyhow::Result;
 use glow::HasContext;
 use std::{
-    cell::{RefCell, RefMut},
+    borrow::Cow,
+    cell::{Cell, RefCell, RefMut},
     collections::HashSet,
     num::NonZeroU32,
     path::PathBuf,
@@ -24,6 +25,7 @@ use crate::{
     APP_CONFIG,
     configuration::Action,
     math::{Vec2D, rect_ensure_in_bounds, rect_round},
+    profiling,
     sketch_board::SketchBoardInput,
     tools::{
         CropTool, Drawable, StyleChange, Tool, Tools,
@@ -35,6 +37,88 @@ use super::{font_stack, set_font_stack};
 
 const TRANSPARENCY_SQUARE_SIZE: usize = 64;
 
+fn pixbuf_pixel_bytes<'a>(
+    src_buffer: &'a [u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+    bytes_per_pixel: usize,
+) -> Result<Cow<'a, [u8]>> {
+    let row_length = width
+        .checked_mul(bytes_per_pixel)
+        .ok_or_else(|| anyhow::anyhow!("Image row length overflow"))?;
+    let expected_len = row_length
+        .checked_mul(height)
+        .ok_or_else(|| anyhow::anyhow!("Image buffer length overflow"))?;
+
+    if stride < row_length {
+        return Err(anyhow::anyhow!(
+            "Pixbuf rowstride {} is smaller than row length {}",
+            stride,
+            row_length
+        ));
+    }
+
+    let required_len = if height == 0 {
+        0
+    } else {
+        (height - 1)
+            .checked_mul(stride)
+            .and_then(|offset| offset.checked_add(row_length))
+            .ok_or_else(|| anyhow::anyhow!("Pixbuf buffer length overflow"))?
+    };
+
+    if src_buffer.len() < required_len {
+        return Err(anyhow::anyhow!(
+            "Pixbuf buffer has {} bytes but {} bytes are required",
+            src_buffer.len(),
+            required_len
+        ));
+    }
+
+    if row_length == stride {
+        profiling::mark_detail(
+            "pixbuf contiguous borrowed",
+            format!("{expected_len} bytes"),
+        );
+        return Ok(Cow::Borrowed(&src_buffer[..expected_len]));
+    }
+
+    let _profile = profiling::scope_detail(
+        "pixbuf row normalization copy",
+        format!("{height} rows, row_length={row_length}, stride={stride}"),
+    );
+    let mut dst_buffer = Vec::<u8>::with_capacity(expected_len);
+
+    for row in 0..height {
+        let src_offset = row * stride;
+        dst_buffer.extend_from_slice(&src_buffer[src_offset..src_offset + row_length]);
+    }
+
+    Ok(Cow::Owned(dst_buffer))
+}
+
+fn typed_pixel_slice<'a, T>(
+    bytes: &'a [u8],
+    expected_pixels: usize,
+    label: &str,
+) -> Result<&'a [T]> {
+    let (prefix, pixels, suffix) = unsafe { bytes.align_to::<T>() };
+
+    if !prefix.is_empty() || !suffix.is_empty() || pixels.len() != expected_pixels {
+        return Err(anyhow::anyhow!(
+            "{label} pixel buffer has invalid layout: {} bytes, {} prefix bytes, {} pixels, {} suffix bytes, expected {} pixels",
+            bytes.len(),
+            prefix.len(),
+            pixels.len(),
+            suffix.len(),
+            expected_pixels
+        ));
+    }
+
+    Ok(pixels)
+}
+
 #[derive(Default)]
 pub struct FemtoVGArea {
     canvas: RefCell<Option<femtovg::Canvas<femtovg::renderer::OpenGl>>>,
@@ -42,6 +126,8 @@ pub struct FemtoVGArea {
     inner: RefCell<Option<FemtoVgAreaMut>>,
     request_render: RefCell<Option<Vec<Action>>>,
     sender: RefCell<Option<Sender<SketchBoardInput>>>,
+    render_count: Cell<u64>,
+    resize_count: Cell<u64>,
 }
 
 pub struct FemtoVgAreaMut {
@@ -186,6 +272,7 @@ impl ObjectSubclass for FemtoVGArea {
 
 impl ObjectImpl for FemtoVGArea {
     fn constructed(&self) {
+        let _profile = profiling::scope("FemtoVGArea::constructed");
         self.parent_constructed();
         let area = self.obj();
         area.set_has_stencil_buffer(true);
@@ -206,6 +293,10 @@ impl WidgetImpl for FemtoVGArea {
 
 impl GLAreaImpl for FemtoVGArea {
     fn resize(&self, width: i32, height: i32) {
+        let count = self.resize_count.get() + 1;
+        self.resize_count.set(count);
+        let _profile =
+            profiling::scope_detail("GLArea::resize", format!("#{count}, {width}x{height}"));
         self.ensure_canvas();
 
         let mut bc = self.canvas.borrow_mut();
@@ -227,6 +318,9 @@ impl GLAreaImpl for FemtoVGArea {
             .update_transformation(canvas);
     }
     fn render(&self, _context: &gtk::gdk::GLContext) -> glib::Propagation {
+        let count = self.render_count.get() + 1;
+        self.render_count.set(count);
+        let _profile = profiling::scope_detail("GLArea::render", format!("#{count}"));
         self.ensure_canvas();
 
         let mut bc = self.canvas.borrow_mut();
@@ -304,6 +398,7 @@ impl FemtoVGArea {
         self.sender.borrow_mut().replace(sender);
     }
     fn ensure_canvas(&self) {
+        let _profile = profiling::scope("FemtoVGArea::ensure_canvas");
         if self.canvas.borrow().is_none() {
             let c = self
                 .setup_canvas()
@@ -319,30 +414,46 @@ impl FemtoVGArea {
     }
 
     fn build_text_context(&self) -> Result<(femtovg::TextContext, Vec<FontId>)> {
+        let _profile = profiling::scope("FemtoVGArea::build_text_context");
         let text_context = femtovg::TextContext::default();
         let mut loaded_fonts = Vec::new();
         let mut loaded_paths = HashSet::<(PathBuf, u32)>::new();
 
         let app_config = APP_CONFIG.read();
-        let fontconfig = Fontconfig::new();
+        let fontconfig = {
+            let _profile = profiling::scope("Fontconfig::new");
+            Fontconfig::new()
+        };
 
         let mut load_font = |family: &str, style: Option<&str>| -> Result<FontId> {
-            let font = fontconfig
-                .as_ref()
-                .and_then(|fc| fc.find(family, style))
-                .ok_or_else(|| anyhow::anyhow!("Font family '{}' not found", family))?;
+            let font = {
+                let _profile =
+                    profiling::scope_detail("fontconfig find", format!("{family} {style:?}"));
+                fontconfig
+                    .as_ref()
+                    .and_then(|fc| fc.find(family, style))
+                    .ok_or_else(|| anyhow::anyhow!("Font family '{}' not found", family))?
+            };
 
             let face_index = font.index.unwrap_or(0).max(0) as u32;
 
             if !loaded_paths.insert((font.path.clone(), face_index)) {
                 return Err(anyhow::anyhow!("Font '{}' already loaded", family));
             }
-            let data = std::fs::read(&font.path)
-                .map_err(|e| anyhow::anyhow!("Failed to read font file: {}", e))?;
+            let data = {
+                let _profile =
+                    profiling::scope_detail("font file read", font.path.display().to_string());
+                std::fs::read(&font.path)
+                    .map_err(|e| anyhow::anyhow!("Failed to read font file: {}", e))?
+            };
 
-            text_context
-                .add_shared_font_with_index(data, face_index)
-                .map_err(|e| anyhow::anyhow!("Failed to load font: {}", e))
+            {
+                let _profile =
+                    profiling::scope_detail("TextContext::add_shared_font", family.to_owned());
+                text_context
+                    .add_shared_font_with_index(data, face_index)
+                    .map_err(|e| anyhow::anyhow!("Failed to load font: {}", e))
+            }
         };
 
         match load_font(
@@ -358,6 +469,7 @@ impl FemtoVGArea {
         }
 
         if loaded_fonts.is_empty() {
+            let _profile = profiling::scope("TextContext::add_font_mem fallback");
             let fallback = text_context
                 .add_font_mem(&resource!("src/assets/Roboto-Regular.ttf"))
                 .expect("Cannot add font");
@@ -379,8 +491,12 @@ impl FemtoVGArea {
     }
 
     fn setup_canvas(&self) -> Result<femtovg::Canvas<femtovg::renderer::OpenGl>> {
+        let _profile = profiling::scope("FemtoVGArea::setup_canvas");
         let widget = self.obj();
-        widget.attach_buffers();
+        {
+            let _profile = profiling::scope("GLArea::attach_buffers");
+            widget.attach_buffers();
+        }
 
         static LOAD_FN: fn(&str) -> *const std::ffi::c_void =
             |s| epoxy::get_proc_addr(s) as *const _;
@@ -389,6 +505,7 @@ impl FemtoVGArea {
         // call attach_buffers beforehand. Also unbind it here just in case,
         // since this can be called outside render.
         let (mut renderer, fbo) = unsafe {
+            let _profile = profiling::scope("OpenGL renderer creation");
             let renderer =
                 renderer::OpenGl::new_from_function(LOAD_FN).expect("Cannot create renderer");
             let ctx = glow::Context::from_loader_function(LOAD_FN);
@@ -400,7 +517,10 @@ impl FemtoVGArea {
         renderer.set_screen_target(Some(fbo));
 
         let (text_context, loaded_fonts) = self.build_text_context()?;
-        let canvas = Canvas::new_with_text_context(renderer, text_context)?;
+        let canvas = {
+            let _profile = profiling::scope("Canvas::new_with_text_context");
+            Canvas::new_with_text_context(renderer, text_context)?
+        };
 
         set_font_stack(loaded_fonts.clone());
         if let Some(first) = loaded_fonts.first() {
@@ -1009,18 +1129,31 @@ impl FemtoVgAreaMut {
         canvas: &mut femtovg::Canvas<femtovg::renderer::OpenGl>,
         image: &Pixbuf,
     ) -> Result<ImageId> {
+        let _profile = profiling::scope_detail(
+            "upload_background_image",
+            format!(
+                "{}x{}, has_alpha={}, rowstride={}",
+                image.width(),
+                image.height(),
+                image.has_alpha(),
+                image.rowstride()
+            ),
+        );
         let format = if image.has_alpha() {
             PixelFormat::Rgba8
         } else {
             PixelFormat::Rgb8
         };
 
-        let background_image_id = canvas.create_image_empty(
-            image.width() as usize,
-            image.height() as usize,
-            format,
-            ImageFlags::empty(),
-        )?;
+        let background_image_id = {
+            let _profile = profiling::scope("canvas.create_image_empty");
+            canvas.create_image_empty(
+                image.width() as usize,
+                image.height() as usize,
+                format,
+                ImageFlags::empty(),
+            )?
+        };
 
         // extract values
         let width = image.width() as usize;
@@ -1029,46 +1162,50 @@ impl FemtoVgAreaMut {
         let bytes_per_pixel = if image.has_alpha() { 4 } else { 3 }; // pixbuf supports rgb or rgba
 
         unsafe {
-            let src_buffer = image.pixels();
-
-            let row_length = width * bytes_per_pixel;
-            let mut dst_buffer = if row_length == stride {
-                // stride == row_length, there are no additional bytes after the end of each row
-                src_buffer.to_vec()
-            } else {
-                // stride != row_length, there are additional bytes after the end of each row that
-                // need to be truncated. We copy row by row..
-                let mut dst_buffer = Vec::<u8>::with_capacity(width * height * bytes_per_pixel);
-
-                for row in 0..height {
-                    let src_offset = row * stride;
-                    dst_buffer.extend_from_slice(&src_buffer[src_offset..src_offset + row_length]);
-                }
-                dst_buffer
+            let src_buffer = {
+                let _profile = profiling::scope("Pixbuf::pixels");
+                image.pixels()
             };
 
-            // in almost all cases, that should be a no-op. Buf we might have additional elements after the
-            // end of the buffer, e.g. after width * height * bytes_per_pixel
-            dst_buffer.truncate(width * height * bytes_per_pixel);
+            let pixel_bytes =
+                pixbuf_pixel_bytes(src_buffer, width, height, stride, bytes_per_pixel)?;
+            let expected_pixels = width
+                .checked_mul(height)
+                .ok_or_else(|| anyhow::anyhow!("Image pixel count overflow"))?;
 
             if image.has_alpha() {
-                let img = Img::new_stride(
-                    dst_buffer.align_to::<RGBA<u8>>().1.to_vec(),
-                    width,
-                    height,
-                    width,
-                );
+                let img = {
+                    let _profile = profiling::scope_detail(
+                        "borrow RGBA image buffer",
+                        format!("{} bytes", pixel_bytes.len()),
+                    );
+                    let pixels = typed_pixel_slice::<RGBA<u8>>(
+                        pixel_bytes.as_ref(),
+                        expected_pixels,
+                        "RGBA",
+                    )?;
+                    Img::new_stride(pixels, width, height, width)
+                };
 
-                canvas.update_image(background_image_id, ImageSource::Rgba(img.as_ref()), 0, 0)?;
+                {
+                    let _profile = profiling::scope("canvas.update_image RGBA");
+                    canvas.update_image(background_image_id, ImageSource::Rgba(img), 0, 0)?;
+                }
             } else {
-                let img = Img::new_stride(
-                    dst_buffer.align_to::<RGB<u8>>().1.to_owned(),
-                    width,
-                    height,
-                    width,
-                );
+                let img = {
+                    let _profile = profiling::scope_detail(
+                        "borrow RGB image buffer",
+                        format!("{} bytes", pixel_bytes.len()),
+                    );
+                    let pixels =
+                        typed_pixel_slice::<RGB<u8>>(pixel_bytes.as_ref(), expected_pixels, "RGB")?;
+                    Img::new_stride(pixels, width, height, width)
+                };
 
-                canvas.update_image(background_image_id, ImageSource::Rgb(img.as_ref()), 0, 0)?;
+                {
+                    let _profile = profiling::scope("canvas.update_image RGB");
+                    canvas.update_image(background_image_id, ImageSource::Rgb(img), 0, 0)?;
+                }
             }
         }
 
@@ -1231,6 +1368,58 @@ mod tests {
         tools::{StyleChange, ToolsManager, edit::ObjectBounds},
     };
     use relm4::gtk::gdk_pixbuf::Colorspace;
+
+    #[test]
+    fn pixbuf_pixel_bytes_borrows_contiguous_rgba() {
+        let src = vec![1_u8, 2, 3, 4, 5, 6, 7, 8];
+        let bytes = pixbuf_pixel_bytes(&src, 2, 1, 8, 4).unwrap();
+
+        assert!(matches!(bytes, Cow::Borrowed(_)));
+        assert_eq!(bytes.as_ref(), src.as_slice());
+
+        let pixels = typed_pixel_slice::<RGBA<u8>>(bytes.as_ref(), 2, "RGBA").unwrap();
+        assert_eq!(pixels[0], RGBA::new(1, 2, 3, 4));
+        assert_eq!(pixels[1], RGBA::new(5, 6, 7, 8));
+    }
+
+    #[test]
+    fn pixbuf_pixel_bytes_normalizes_padded_rgba_rows() {
+        let src = vec![
+            1_u8, 2, 3, 4, 5, 6, 7, 8, 99, 99, 10, 11, 12, 13, 14, 15, 16, 17, 88, 88,
+        ];
+        let bytes = pixbuf_pixel_bytes(&src, 2, 2, 10, 4).unwrap();
+
+        assert!(matches!(bytes, Cow::Owned(_)));
+        assert_eq!(
+            bytes.as_ref(),
+            &[1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17]
+        );
+
+        let pixels = typed_pixel_slice::<RGBA<u8>>(bytes.as_ref(), 4, "RGBA").unwrap();
+        assert_eq!(pixels[2], RGBA::new(10, 11, 12, 13));
+        assert_eq!(pixels[3], RGBA::new(14, 15, 16, 17));
+    }
+
+    #[test]
+    fn pixbuf_pixel_bytes_borrows_contiguous_rgb() {
+        let src = vec![1_u8, 2, 3, 4, 5, 6];
+        let bytes = pixbuf_pixel_bytes(&src, 2, 1, 6, 3).unwrap();
+
+        assert!(matches!(bytes, Cow::Borrowed(_)));
+
+        let pixels = typed_pixel_slice::<RGB<u8>>(bytes.as_ref(), 2, "RGB").unwrap();
+        assert_eq!(pixels[0], RGB::new(1, 2, 3));
+        assert_eq!(pixels[1], RGB::new(4, 5, 6));
+    }
+
+    #[test]
+    fn pixbuf_pixel_bytes_rejects_invalid_layouts() {
+        let short = vec![1_u8, 2, 3];
+
+        assert!(pixbuf_pixel_bytes(&short, 2, 1, 8, 4).is_err());
+        assert!(pixbuf_pixel_bytes(&short, 2, 1, 7, 4).is_err());
+        assert!(typed_pixel_slice::<RGBA<u8>>(&short, 1, "RGBA").is_err());
+    }
 
     #[derive(Clone, Debug)]
     struct TestDrawable {
