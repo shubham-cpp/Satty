@@ -265,7 +265,7 @@ impl SimpleComponent for ToolsToolbar {
                 set_hexpand: false,
 
                 set_icon_name: "copy-regular",
-                set_tooltip: "Copy to clipboard (Ctrl+C)",
+                set_tooltip: "Copy to clipboard",
                 connect_clicked[sender] => move |_| {sender.output_sender().emit(ToolbarEvent::CopyClipboard);},
             },
             gtk::Button {

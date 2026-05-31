@@ -32,6 +32,14 @@ use xdg::BaseDirectories;
 type RenderedImage = Img<Vec<RGBA<u8>>>;
 const SAVE_AS_LAST_DIR_FILE: &str = "save_as_last_dir";
 const SAVE_AS_LAST_DIR_MAX_BYTES: u64 = 10_000;
+const WL_COPY_IMAGE_COMMAND: &str = "wl-copy --type image/png";
+
+#[derive(Debug, PartialEq, Eq)]
+enum ImageClipboardCopyTarget<'a> {
+    ConfiguredCommand(&'a str),
+    WlCopyImage,
+    GtkClipboard,
+}
 
 #[derive(Debug, Clone)]
 pub enum SketchBoardInput {
@@ -683,13 +691,42 @@ impl SketchBoard {
         self.save_bytes_to_external_process(texture.save_to_png_bytes().as_ref(), command)
     }
 
+    fn image_clipboard_copy_targets<'a>(
+        configured_command: Option<&'a str>,
+    ) -> Vec<ImageClipboardCopyTarget<'a>> {
+        match configured_command {
+            Some(command) => vec![ImageClipboardCopyTarget::ConfiguredCommand(command)],
+            None => vec![
+                ImageClipboardCopyTarget::WlCopyImage,
+                ImageClipboardCopyTarget::GtkClipboard,
+            ],
+        }
+    }
+
+    fn save_texture_to_default_clipboard(&self, texture: &impl IsA<Texture>) -> anyhow::Result<()> {
+        match self.save_texture_to_external_process(texture, WL_COPY_IMAGE_COMMAND) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("wl-copy image copy failed, falling back to GTK clipboard: {e}");
+                self.save_texture_to_clipboard(texture)
+            }
+        }
+    }
+
     fn handle_copy_clipboard(&self, image: &Pixbuf) {
         let texture = Texture::for_pixbuf(image);
 
-        let result = if let Some(command) = APP_CONFIG.read().copy_command() {
-            self.save_texture_to_external_process(&texture, command)
-        } else {
-            self.save_texture_to_clipboard(&texture)
+        let copy_command = APP_CONFIG.read().copy_command().cloned();
+        let result = match Self::image_clipboard_copy_targets(copy_command.as_deref()).first() {
+            Some(ImageClipboardCopyTarget::ConfiguredCommand(command)) => {
+                self.save_texture_to_external_process(&texture, command)
+            }
+            Some(ImageClipboardCopyTarget::WlCopyImage) => {
+                self.save_texture_to_default_clipboard(&texture)
+            }
+            Some(ImageClipboardCopyTarget::GtkClipboard) | None => {
+                self.save_texture_to_clipboard(&texture)
+            }
         };
 
         match result {
@@ -1321,7 +1358,8 @@ impl Component for SketchBoard {
                             } else if ke.is_one_of(Key::c, KeyMappingId::UsC)
                                 && ke.modifier == ModifierType::CONTROL_MASK
                             {
-                                self.renderer.request_render(&[Action::SaveToClipboard]);
+                                self.renderer
+                                    .request_render(&[Action::SaveToClipboard, Action::Exit]);
                                 ToolUpdateResult::Unmodified
                             } else if ke.is_one_of(Key::c, KeyMappingId::UsC)
                                 && ke.modifier
@@ -1610,7 +1648,9 @@ impl KeyEventMsg {
 
 #[cfg(test)]
 mod tests {
-    use super::{MouseButton, MouseEventMsg, MouseEventType, SketchBoard};
+    use super::{
+        ImageClipboardCopyTarget, MouseButton, MouseEventMsg, MouseEventType, SketchBoard,
+    };
     use relm4::gtk::gdk::ModifierType;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1654,6 +1694,29 @@ mod tests {
         };
 
         assert!(SketchBoard::temporary_pointer_modifier(&event));
+    }
+
+    #[test]
+    fn image_clipboard_copy_targets_prefers_configured_command() {
+        let targets = SketchBoard::image_clipboard_copy_targets(Some("wl-copy"));
+
+        assert_eq!(
+            targets,
+            vec![ImageClipboardCopyTarget::ConfiguredCommand("wl-copy")]
+        );
+    }
+
+    #[test]
+    fn image_clipboard_copy_targets_defaults_to_wl_copy_then_gtk() {
+        let targets = SketchBoard::image_clipboard_copy_targets(None);
+
+        assert_eq!(
+            targets,
+            vec![
+                ImageClipboardCopyTarget::WlCopyImage,
+                ImageClipboardCopyTarget::GtkClipboard
+            ]
+        );
     }
 
     #[test]

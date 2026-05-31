@@ -61,7 +61,7 @@ pub struct CommandLine {
     #[arg(long, value_name = "TOOL", visible_alias = "init-tool")]
     pub initial_tool: Option<Tools>,
 
-    /// Configure the command to be called on copy, for example `wl-copy`
+    /// Configure the command to be called on copy, for example `wl-copy --type image/png`
     #[arg(long)]
     pub copy_command: Option<String>,
 

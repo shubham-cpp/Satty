@@ -44,7 +44,7 @@ All configuration is done either at the config file in `XDG_CONFIG_DIR/.config/s
 - <kbd>Enter</kbd>: as configured (see below), default: copy-to-clipboard (may be masked by active tool)
 - <kbd>Esc</kbd>: as configured (see below), default: exit (may be masked by active tool)
 - <kbd>Delete</kbd> reset (clear) <sup>experimental</sup> <sup>0.20.1</sup>
-- <kbd>Ctrl+C</kbd>: Save to clipboard (may be masked by active tool)
+- <kbd>Ctrl+C</kbd>: Save to clipboard and close (may be masked by active tool)
 - <kbd>Ctrl+Shift+D</kbd> or <kbd>Ctrl+Shift+I</kbd>: Open GTK inspector if not already opened
 - <kbd>Ctrl+S</kbd>: Save to specified output file
 - <kbd>Ctrl+Shift+S</kbd>: Save using file dialog <sup>0.20.0</sup>. The dialog uses `output-filename` as initial filename/path when available and remembers the last selected folder. <sup>NEXTRELEASE</sup>
@@ -124,8 +124,8 @@ early-exit-save-as = true
 corner-roundness = 12
 # Select the tool on startup [possible values: pointer, crop, line, arrow, rectangle, text, marker, blur, brush]
 initial-tool = "brush"
-# Configure the command to be called on copy, for example `wl-copy`
-copy-command = "wl-copy"
+# Configure the command to be called on copy, for example `wl-copy --type image/png`
+copy-command = "wl-copy --type image/png"
 # Increase or decrease the size of the annotations
 annotation-size-factor = 2
 # Filename to use for saving action. Omit to disable saving to file. Might contain format specifiers: https://docs.rs/chrono/latest/chrono/format/strftime/index.html
@@ -271,7 +271,7 @@ Options:
       --initial-tool <TOOL>
           Select the tool on startup [aliases: --init-tool] [possible values: pointer, crop, line, arrow, rectangle, ellipse, text, marker, blur, highlight, brush]
       --copy-command <COPY_COMMAND>
-          Configure the command to be called on copy, for example `wl-copy`
+          Configure the command to be called on copy, for example `wl-copy --type image/png`
       --annotation-size-factor <ANNOTATION_SIZE_FACTOR>
           Increase or decrease the size of the annotations
       --save-after-copy
@@ -377,7 +377,7 @@ It needs `grim` and `slurp`.
 ```sh
 # screenshots
 # inspiration: https://www.reddit.com/r/swaywm/comments/ghnlea/comment/fqnzxkx/?utm_source=share&utm_medium=web3x&utm_name=web3xcss&utm_term=1&utm_content=share_button
-set $satty satty -f - --initial-tool=arrow --copy-command=wl-copy --actions-on-escape="save-to-clipboard,exit" --brush-smooth-history-size=5 --disable-notifications
+set $satty satty -f - --initial-tool=arrow --copy-command="wl-copy --type image/png" --actions-on-escape="save-to-clipboard,exit" --brush-smooth-history-size=5 --disable-notifications
 set $printscreen_mode 'printscreen (r:region, f:full, w:window)'
 mode $printscreen_mode {
     bindsym r exec swaymsg 'mode "default"' && grim -t ppm -g "$(slurp -d)" - | $satty
